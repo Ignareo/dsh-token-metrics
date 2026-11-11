@@ -39,9 +39,15 @@ provider-balance management.
   into tokens, allowance spend and share, plus a "what does 1% mean in tokens"
   estimate; switchable Go / Go Plus / Go Teams
 - **Single-model capacity**: if you only used one model, how many tokens each
-  window buys (three extremes + your last-30-day mix)
+  window buys. Besides the three extremes, "your mix" is priced with the
+  ledger's own peak/off-peak weighted average (the same ruler as the monthly-cap
+  column); off-peak caps and peak floors live in the tooltip, and the
+  composition line also shows the **cost split** (cache reads are 98% of tokens
+  but output is 200x their unit price, so cost is roughly one third each)
 - The ledger is a separate 10-minute-bucket file, so `usage.json` writes do not
   grow; allowance is a **dollar quota**, not a token quota
+- Remaining quota is computed against **that model's own** budget; the
+  account-level window percentage is shown separately for comparison
 
 **Model access**
 

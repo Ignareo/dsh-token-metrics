@@ -278,7 +278,7 @@ window.__ModuleLoader__.load({
       'quota.samplesUnit': '条',
       'quota.footnote': '额度列与 OpenCode 的 allowance 同口径（list_cost × 60 / 月额度）；「占月额度」按官方每月美元上限计算。',
       'quota.capacityTitle': '单模型额度换算',
-      'quota.capacityHint': '假设只用这一个模型：窗口额度能换多少 token。实际取决于输入 / 输出 / 缓存读的比例',
+      'quota.capacityHint': '假设只用这一个模型：窗口额度能换多少 token。实际取决于输入 / 输出 / 缓存读的比例，以及峰谷时段',
       'quota.capacityMonthly': '月额度',
       'quota.capacityFactor': '额度系数',
       'quota.capacityWindow': '窗口',
@@ -286,14 +286,23 @@ window.__ModuleLoader__.load({
       'quota.capacityInput': '纯输入',
       'quota.capacityOutput': '纯输出',
       'quota.capacityCache': '纯缓存读',
+      'quota.capacityWrite': '缓存写',
       'quota.capacityMixed': '按你的结构',
       'quota.capacityComposition': '你的历史构成',
-      'quota.capacityNoComposition': '没有这个模型的历史调用，先看三种极端值；跑几次后这里会按你的缓存命中率折算',
+      'quota.capacityCostShare': '费用构成',
+      'quota.capacityNoComposition': '没有这个模型的历史调用，先看三种极端值；跑几次后这里会按你的实际构成与峰谷分布折算',
       'quota.capacityPeak': 'DeepSeek 峰时（UTC 01–04 / 06–10）表中 token 数减半',
+      'quota.capacityPeakActual': 'DeepSeek 峰谷价（UTC 01–04 / 06–10）已按你的实际时段折算',
+      'quota.capacityBasisActual': '实际均价',
+      'quota.capacityBasisOff': '无历史构成，按谷时价',
+      'quota.capacityOffPeak': '谷时上界',
+      'quota.capacityPeakBound': '峰时下界',
       'quota.capacityTier': 'prompt 超过该模型的长上下文档位时单价翻倍，表中按低档价',
       'quota.capacityCalls': '次调用',
       'quota.failed': '个失败',
       'quota.capacityRemaining': '剩',
+      'quota.capacityModelRemaining': '该模型剩',
+      'quota.capacitySiteRemaining': '账户剩',
 
       'supplier.title': '模型接入',
       'supplier.subtitle': '接入第三方中转站与官方平台：余额、可用模型，并同步到 DSH 模型配置',
@@ -811,7 +820,7 @@ window.__ModuleLoader__.load({
       'quota.samplesUnit': '',
       'quota.footnote': 'Allowance matches OpenCode\'s allowance (list_cost × 60 / monthly cap); "Monthly cap" uses the official per-model USD limit.',
       'quota.capacityTitle': 'Single-model capacity',
-      'quota.capacityHint': 'If you only used this model: how many tokens each window buys. Depends on input / output / cache-read mix',
+      'quota.capacityHint': 'If you only used this model: how many tokens each window buys. Depends on input / output / cache-read mix and peak/off-peak hours',
       'quota.capacityMonthly': 'Monthly cap',
       'quota.capacityFactor': 'Factor',
       'quota.capacityWindow': 'Window',
@@ -819,14 +828,23 @@ window.__ModuleLoader__.load({
       'quota.capacityInput': 'All input',
       'quota.capacityOutput': 'All output',
       'quota.capacityCache': 'All cache read',
+      'quota.capacityWrite': 'Cache write',
       'quota.capacityMixed': 'Your mix',
       'quota.capacityComposition': 'Your composition',
-      'quota.capacityNoComposition': 'No history for this model yet — the three extremes are shown; once you use it, this column follows your cache-hit ratio',
+      'quota.capacityCostShare': 'Cost split',
+      'quota.capacityNoComposition': 'No history for this model yet — the three extremes are shown; once you use it, this table follows your actual mix and peak/off-peak hours',
       'quota.capacityPeak': 'DeepSeek peak hours (UTC 01–04 / 06–10) halve these token counts',
+      'quota.capacityPeakActual': 'DeepSeek peak pricing (UTC 01–04 / 06–10) is already reflected for your hours',
+      'quota.capacityBasisActual': 'effective price',
+      'quota.capacityBasisOff': 'no history — off-peak price',
+      'quota.capacityOffPeak': 'off-peak cap',
+      'quota.capacityPeakBound': 'peak floor',
       'quota.capacityTier': 'Above the long-context tier price doubles; this table uses the low tier',
       'quota.capacityCalls': 'calls',
       'quota.failed': 'failed',
       'quota.capacityRemaining': 'left',
+      'quota.capacityModelRemaining': 'model left',
+      'quota.capacitySiteRemaining': 'account left',
 
       'supplier.title': 'Model Access',
       'supplier.subtitle': 'Add relay stations and official platforms: balances, models, and DSH config sync',
@@ -6740,6 +6758,11 @@ function formatMoneyText(value) {
       /**
        * 单模型额度换算：把窗口额度按三种极端构成和「你的实际构成」折算成 token。
        * 选中模型默认取本周消耗最多的那个——通常是用户最关心的。
+       *
+       * 「按你的结构」用账本按实际峰谷价算出的均价，和上方「占月额度」同一把
+       * 尺子；谷时上界 / 峰时下界放在悬停提示里，避免把上界当成「还能跑多少」。
+       * 「你的历史构成」下面补一行费用构成：缓存读占 token 的 98%，但输出单价
+       * 是它的 200 倍，只看 token 比例会严重高估能跑的 token 数。
        */
       const capacitySection = () => {
         const catalog = data?.catalog ?? []
@@ -6751,12 +6774,54 @@ function formatMoneyText(value) {
         const capacity = data.modelCapacity?.[selected]
         if (capacity === undefined) return null
         const comp = capacity.composition
+        // 小于 10% 保留一位小数：0.49% 被四舍五入成 0%，会让人以为输出不花钱。
+        const pct = (value) => {
+          const n = Number(value)
+          if (!Number.isFinite(n)) return '—'
+          return `${n >= 10 ? Math.round(n) : Math.round(n * 10) / 10}%`
+        }
+        const share = (tokens) => (comp.tokens > 0 ? (tokens / comp.tokens) * 100 : undefined)
+        const costShare = comp?.costShare
         const compositionText = comp === null || comp === undefined
           ? t('quota.capacityNoComposition')
-          : `${t('quota.capacityComposition')}：${t('quota.capacityInput')} ${Math.round((comp.inputTokens / comp.tokens) * 100)}% · ${t('quota.capacityOutput')} ${Math.round((comp.outputTokens / comp.tokens) * 100)}% · ${t('quota.capacityCache')} ${Math.round((comp.cacheReadTokens / comp.tokens) * 100)}%`
-            + (comp.cacheWriteTokens > 0 ? ` · ${Math.round((comp.cacheWriteTokens / comp.tokens) * 100)}% write` : '')
+          : `${t('quota.capacityComposition')}：${t('quota.capacityInput')} ${pct(share(comp.inputTokens))} · ${t('quota.capacityOutput')} ${pct(share(comp.outputTokens))} · ${t('quota.capacityCache')} ${pct(share(comp.cacheReadTokens))}`
+            + (comp.cacheWriteTokens > 0 ? ` · ${t('quota.capacityWrite')} ${pct(share(comp.cacheWriteTokens))}` : '')
             + `（${comp.calls} ${t('quota.capacityCalls')}）`
+        const costText = costShare === undefined
+          ? null
+          : `${t('quota.capacityCostShare')}：${t('quota.capacityInput')} ${pct(costShare.input * 100)} · ${t('quota.capacityOutput')} ${pct(costShare.output * 100)} · ${t('quota.capacityCache')} ${pct(costShare.cacheRead * 100)}`
+            + (costShare.cacheWrite > 0 ? ` · ${t('quota.capacityWrite')} ${pct(costShare.cacheWrite * 100)}` : '')
         const cell = (value) => (Number.isFinite(value) ? formatCompact(value) : '—')
+        // 宿主先升级、客户端还是旧版（或反之）时，payload 里没有 basis：
+        // 此时 remaining 仍是旧宿主算的账户口径，标签不能写「该模型剩」。
+        const modern = capacity.basis !== undefined
+        const boundsTip = (window, key) => {
+          // 非峰谷模型上下界相同，提示只会重复，直接不给。
+          if (capacity.peak !== true) return undefined
+          const parts = []
+          const off = window.bounds?.offPeak?.[key]
+          const peak = window.bounds?.peak?.[key]
+          if (Number.isFinite(off)) parts.push(`${t('quota.capacityOffPeak')} ${formatCompact(off)}`)
+          if (Number.isFinite(peak)) parts.push(`${t('quota.capacityPeakBound')} ${formatCompact(peak)}`)
+          return parts.length === 0 ? undefined : parts.join(' · ')
+        }
+        const mixedTip = (window) => {
+          const lines = []
+          const remaining = window.remaining
+          const modelLabel = modern ? t('quota.capacityModelRemaining') : t('quota.capacityRemaining')
+          if (remaining?.percent !== undefined) {
+            lines.push(remaining.tokens === undefined
+              ? `${modelLabel} ${remaining.percent}%`
+              : `${modelLabel} ${remaining.percent}% ≈ ${formatCompact(remaining.tokens)} token`)
+          }
+          // 账户余额只给百分比：它管整个订阅，折成本模型的 token 会混淆口径。
+          if (modern && remaining?.sitePercent !== undefined) {
+            lines.push(`${t('quota.capacitySiteRemaining')} ${remaining.sitePercent}%`)
+          }
+          const bounds = boundsTip(window, 'mixed')
+          if (bounds !== undefined) lines.push(bounds)
+          return lines.length === 0 ? undefined : lines.join('\n')
+        }
         return h('section', { className: 'tu-qcap' },
           h('div', { className: 'tu-qcap-head' },
             h('div', null,
@@ -6774,7 +6839,14 @@ function formatMoneyText(value) {
           ),
           h('div', { className: 'tu-qcap-meta' },
             `${t('quota.capacityMonthly')} $${formatMoneyText(capacity.cap)} · ${t('quota.capacityFactor')} ${capacity.factor.toFixed(2)}×`,
-            capacity.peak ? ` · ${t('quota.capacityPeak')}` : null,
+            capacity.peak !== true || capacity.basis === undefined
+              ? null
+              : capacity.basis === 'actual'
+                ? ` · ${t('quota.capacityBasisActual')} $${formatMoneyText((capacity.weight ?? 0) * 1e6)}/M`
+                : ` · ${t('quota.capacityBasisOff')}`,
+            capacity.peak
+              ? ` · ${capacity.basis === 'actual' ? t('quota.capacityPeakActual') : t('quota.capacityPeak')}`
+              : null,
           ),
           h('table', { className: 'tu-qtable' },
             h('thead', null, h('tr', null,
@@ -6788,18 +6860,14 @@ function formatMoneyText(value) {
             h('tbody', null, capacity.windows.map((window) => h('tr', { key: window.key },
               h('td', null, t(`quota.window.${window.key}`)),
               h('td', null, `$${formatMoneyText(window.budget)}`),
-              h('td', null, cell(window.tokens.input)),
-              h('td', null, cell(window.tokens.output)),
-              h('td', null, cell(window.tokens.cacheRead)),
-              h('td', {
-                className: 'tu-qcap-mixed',
-                title: window.remaining?.tokens === undefined
-                  ? undefined
-                  : `${t('quota.capacityRemaining')} ${window.remaining.percent}% ≈ ${formatCompact(window.remaining.tokens)} token`,
-              }, cell(window.tokens.mixed)),
+              h('td', { title: boundsTip(window, 'input') }, cell(window.tokens.input)),
+              h('td', { title: boundsTip(window, 'output') }, cell(window.tokens.output)),
+              h('td', { title: boundsTip(window, 'cacheRead') }, cell(window.tokens.cacheRead)),
+              h('td', { className: 'tu-qcap-mixed', title: mixedTip(window) }, cell(window.tokens.mixed)),
             ))),
           ),
           h('div', { className: 'tu-qcap-note' }, compositionText),
+          costText === null ? null : h('div', { className: 'tu-qcap-note' }, costText),
           capacity.tiered ? h('div', { className: 'tu-qcap-note' }, t('quota.capacityTier')) : null,
         )
       }

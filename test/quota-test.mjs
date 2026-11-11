@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   windowKeyOf, isPeakTime, rateAt, listCostOf, totalTokens,
-  factorFor, capsFor, QuotaLedger, probeFactors, WINDOWS, BUCKET_MS, modelCapacity,
+  factorFor, capsFor, QuotaLedger, probeFactors, WINDOWS, BUCKET_MS, modelCapacity, RATES,
 } from '../src/quota.js'
 
 const failures = []
@@ -91,6 +91,8 @@ close('Grok 5h 纯缓存 token', grok5h.tokens.cacheRead, 6_000_000, 1)
 // 构成：13.2% 输入 + 4.9% 输出 + 81.9% 缓存读，加权 $0.9675/M。
 close('Grok 5h 按实际结构 token', grok5h.tokens.mixed, 3_100_000, 20_000)
 check('Grok 月额度', grokCapacity.cap, 15)
+// 非峰谷模型：上界与下界必须相同，界面才不会给出重复提示。
+close('非峰谷模型上下界一致', grok5h.bounds.peak.mixed, grok5h.bounds.offPeak.mixed, 1e-9)
 
 const deepseekCapacity = modelCapacity({ model: 'deepseek-v4.1-flash', planId: 'go' })
 const ds5h = deepseekCapacity.windows.find((item) => item.key === 'rolling')
@@ -101,6 +103,83 @@ check('没有构成时 mixed 为空', ds5h.tokens.mixed, undefined)
 
 // 免费模型没有额度上限，不参与换算。
 check('免费模型无额度', modelCapacity({ model: 'beam-free' }), undefined)
+
+// —— 有账本成本时，按实际峰谷均价折算 ——
+// 全部 token 发生在峰时：实际均价 = 峰时价，(谷时上界 > 实际 > 峰时下界)。
+const actualComposition = {
+  calls: 500,
+  tokens: 11_100_000,
+  inputTokens: 1_000_000,
+  outputTokens: 100_000,
+  cacheReadTokens: 10_000_000,
+  cacheWriteTokens: 0,
+  // 峰时价：输入 0.30/M、输出 1.20/M、缓存读 0.006/M。
+  listCost: 0.48,
+  costInput: 0.30,
+  costOutput: 0.12,
+  costCacheRead: 0.06,
+  costCacheWrite: 0,
+}
+const dsActual = modelCapacity({
+  model: 'deepseek-v4.1-flash',
+  composition: actualComposition,
+  planId: 'go',
+  percents: { monthly: 98 },
+  modelPercents: { monthly: 56.4 },
+})
+const dsMonth = dsActual.windows.find((item) => item.key === 'monthly')
+check('有成本时按实际均价', dsActual.basis, 'actual')
+close('混合均价 = 账本成本 / token', dsActual.weight, 0.48 / 11_100_000, 1e-15)
+// 100 / (0.48 / 11.1M) = 2.3125e9：和「占月额度」同一把尺子。
+close('按实际峰谷的月 token', dsMonth.tokens.mixed, (100 * 11_100_000) / 0.48, 1)
+close('纯输入按实际均价（峰时）', dsMonth.tokens.input, 100 / 0.30e-6, 1)
+close('纯输入谷时上界', dsMonth.bounds.offPeak.input, 100 / 0.15e-6, 1)
+close('纯输入峰时下界', dsMonth.bounds.peak.input, 100 / 0.30e-6, 1)
+close('谷时上界 mixed', dsMonth.bounds.offPeak.mixed, (100 * 11_100_000) / 0.24, 1)
+close('峰时下界 mixed', dsMonth.bounds.peak.mixed, (100 * 11_100_000) / 0.48, 1)
+checkTrue('实际落在上下界之间', dsMonth.tokens.mixed <= dsMonth.bounds.offPeak.mixed
+  && dsMonth.tokens.mixed >= dsMonth.bounds.peak.mixed)
+// 费用构成：输入 0.30 / 输出 0.12 / 缓存读 0.06 → 62.5% / 25% / 12.5%。
+close('费用构成 输入', dsActual.composition.costShare.input, 0.625, 1e-9)
+close('费用构成 输出', dsActual.composition.costShare.output, 0.25, 1e-9)
+close('费用构成 缓存读', dsActual.composition.costShare.cacheRead, 0.125, 1e-9)
+// 剩余额度用该模型自己的百分比（56.4%），账户百分比只作对照。
+close('剩余 = 该模型口径', dsMonth.remaining.percent, 43.6, 1e-9)
+close('剩余 token', dsMonth.remaining.tokens, (100 * 0.436) / (0.48 / 11_100_000), 1)
+close('账户剩余对照', dsMonth.remaining.sitePercent, 2, 1e-9)
+
+close('峰谷模型上下界不同', dsMonth.bounds.offPeak.mixed > dsMonth.bounds.peak.mixed, true)
+// 这批构成全在峰时，所以实际值正好等于峰时下界。
+checkTrue('峰谷模型实际落在区间内', dsMonth.tokens.mixed <= dsMonth.bounds.offPeak.mixed
+  && dsMonth.tokens.mixed >= dsMonth.bounds.peak.mixed)
+
+// 只配 `off` 不配 `peak` 的价目（外部扩展时可能出现）：峰时价回落谷时价，
+// 上下界不能缺一半——否则界面 `peak: true` 但提示是空的。
+RATES['test-off-only'] = {
+  cap: 60, input: 0.30e-6, output: 1.20e-6, cacheRead: 0.006e-6, cacheWrite: 0,
+  off: { input: 0.15e-6, output: 0.60e-6, cacheRead: 0.003e-6 },
+}
+const offOnlyCapacity = modelCapacity({
+  model: 'test-off-only',
+  composition: {
+    calls: 1, tokens: 1_000_000,
+    inputTokens: 1_000_000, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
+  },
+  planId: 'go',
+})
+const offOnlyRow = offOnlyCapacity.windows[0]
+close('缺 peak 时峰时价回落谷时', offOnlyRow.bounds.peak.mixed, offOnlyRow.bounds.offPeak.mixed, 1e-9)
+check('缺 peak 时仍标记峰谷', offOnlyCapacity.peak, true)
+delete RATES['test-off-only']
+
+// 没有成本字段（旧数据/外部构造）时退回谷时价，并标注 basis。
+const dsNoCost = modelCapacity({
+  model: 'deepseek-v4.1-flash',
+  composition: { ...actualComposition, listCost: 0, costInput: 0, costOutput: 0, costCacheRead: 0 },
+  planId: 'go',
+})
+check('无成本时退回谷时', dsNoCost.basis, 'off-peak')
+close('无成本时 mixed 用谷时价', dsNoCost.windows[2].tokens.mixed, (100 * 11_100_000) / 0.24, 1)
 
 //#endregion
 
@@ -137,6 +216,17 @@ const models = ledger.usageBetween('opencode-go', bucketStart, bucketStart + BUC
 check('只统计额度 provider', Object.keys(models).sort(), ['deepseek-v4.1-flash', 'glm-5.3-flash'])
 check('深寻 token 合计', totalTokens(models['deepseek-v4.1-flash']), 1120)
 check('GLM token 合计', totalTokens(models['glm-5.3-flash']), 2240)
+
+// 成本按 token 类型分记（单模型额度换算要用它算实际均价）。t1 是峰时：
+// 输入 0.30/M、输出 1.20/M、缓存读 0.006/M。
+const dsCost = models['deepseek-v4.1-flash']
+close('深寻输入成本', dsCost.costInput, 100 * 0.30e-6, 1e-15)
+close('深寻输出成本', dsCost.costOutput, 20 * 1.20e-6, 1e-15)
+close('深寻缓存读成本', dsCost.costCacheRead, 1000 * 0.006e-6, 1e-15)
+close('分项成本之和 = listCost', dsCost.listCost,
+  dsCost.costInput + dsCost.costOutput + dsCost.costCacheRead + dsCost.costCacheWrite, 1e-15)
+// GLM 没有峰谷价，同价目。
+close('GLM 输入成本', models['glm-5.3-flash'].costInput, 200 * 0.15e-6, 1e-15)
 
 // 窗口起点落在桶中间：按重叠比例摊分。桶长 10 分钟，取后一半。
 const half = ledger.usageBetween('opencode-go', bucketStart + 5 * 60 * 1000, bucketStart + 10 * 60 * 1000)
@@ -178,6 +268,16 @@ close('深寻额度 = list × 0.6', deepseek.allowance, deepseek.listCost * 0.6,
 check('深寻占月额度', Math.round(deepseek.monthlyUsedPct * 1e6) / 1e6, Math.round((deepseek.listCost / 100) * 100 * 1e6) / 1e6)
 checkTrue('1% token 当量', rolling.perPct.tokens > 0)
 checkTrue('剩余 token 当量', rolling.remaining.tokens > 0)
+
+// 单模型额度换算：剩余按该模型自己的消耗算，账户百分比只作对照——
+// 账户 46% 不代表这个模型的 $100 月度额度用掉了 46%。
+const monthCapacity = summary.modelCapacity['deepseek-v4.1-flash']
+const monthRow = monthCapacity.windows.find((item) => item.key === 'monthly')
+close('剩余百分比 = 100 - 该模型占月额度', monthRow.remaining.percent,
+  Math.round((100 - deepseek.monthlyUsedPct) * 10) / 10, 0.11)
+close('账户剩余百分比', monthRow.remaining.sitePercent, 54, 1e-9)
+check('构成带成本占比', monthCapacity.composition.costShare !== undefined, true)
+close('成本占比之和', Object.values(monthCapacity.composition.costShare).reduce((a, b) => a + b, 0), 1, 1e-9)
 
 // 无百分比时仍然给出 token/额度，只是不折算百分点。
 const noPercent = ledger.summary({

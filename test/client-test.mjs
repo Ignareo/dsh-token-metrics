@@ -151,14 +151,43 @@ const quotaResponse = {
   modelCapacity: {
     'deepseek-v4.1-flash': {
       model: 'deepseek-v4.1-flash', cap: 100, factor: 0.6, peak: true, tiered: false,
+      // 有成本时按账本实际峰谷均价（$0.01464/M），窗口预算 ÷ 它就是 mixed。
+      basis: 'actual',
+      weight: 1.464e-8,
+      rates: { input: 2.5475e-7, output: 1.016e-6, cacheRead: 4.89e-9, cacheWrite: 0 },
       composition: {
-        calls: 488, tokens: 79_500_000, inputTokens: 1_350_000, outputTokens: 450_000,
-        cacheReadTokens: 77_600_000, cacheWriteTokens: 0,
+        calls: 488, tokens: 79_500_000, inputTokens: 1_350_000, outputTokens: 380_000,
+        cacheReadTokens: 77_770_000, cacheWriteTokens: 0,
+        costShare: { input: 0.338, output: 0.336, cacheRead: 0.326, cacheWrite: 0 },
       },
       windows: [
-        { key: 'rolling', share: 0.2, budget: 20, tokens: { input: 133_333_333, output: 33_333_333, cacheRead: 6_666_666_667, mixed: 1_500_000_000 }, remaining: { percent: 99, tokens: 1_485_000_000 } },
-        { key: 'weekly', share: 0.5, budget: 50, tokens: { input: 333_333_333, output: 83_333_333, cacheRead: 16_666_666_667, mixed: 3_750_000_000 }, remaining: { percent: 59, tokens: 2_212_500_000 } },
-        { key: 'monthly', share: 1, budget: 100, tokens: { input: 666_666_667, output: 166_666_667, cacheRead: 33_333_333_333, mixed: 7_500_000_000 }, remaining: { percent: 54, tokens: 4_050_000_000 } },
+        {
+          key: 'rolling', share: 0.2, budget: 20,
+          tokens: { input: 78_500_000, output: 19_700_000, cacheRead: 4_090_000_000, mixed: 1_366_000_000 },
+          bounds: {
+            offPeak: { input: 133_333_333, output: 33_333_333, cacheRead: 6_666_666_667, mixed: 2_280_000_000 },
+            peak: { input: 66_666_667, output: 16_666_667, cacheRead: 3_333_333_333, mixed: 1_140_000_000 },
+          },
+          remaining: { percent: 95.8, tokens: 1_308_000_000, sitePercent: 89 },
+        },
+        {
+          key: 'weekly', share: 0.5, budget: 50,
+          tokens: { input: 196_300_000, output: 49_200_000, cacheRead: 10_220_000_000, mixed: 3_415_000_000 },
+          bounds: {
+            offPeak: { input: 333_333_333, output: 83_333_333, cacheRead: 16_666_666_667, mixed: 5_700_000_000 },
+            peak: { input: 166_666_667, output: 41_666_667, cacheRead: 8_333_333_333, mixed: 2_850_000_000 },
+          },
+          remaining: { percent: 35.7, tokens: 1_219_000_000, sitePercent: 17, siteTokens: 580_000_000 },
+        },
+        {
+          key: 'monthly', share: 1, budget: 100,
+          tokens: { input: 392_500_000, output: 98_400_000, cacheRead: 20_450_000_000, mixed: 6_830_000_000 },
+          bounds: {
+            offPeak: { input: 666_666_667, output: 166_666_667, cacheRead: 33_333_333_333, mixed: 11_400_000_000 },
+            peak: { input: 333_333_333, output: 83_333_333, cacheRead: 16_666_666_667, mixed: 5_700_000_000 },
+          },
+          remaining: { percent: 43.6, tokens: 2_977_000_000, sitePercent: 2 },
+        },
       ],
     },
     'grok-4.7': {
@@ -2216,6 +2245,28 @@ const discoveredEntry = () => ({
   check('显示纯缓存列', flat.includes('纯缓存读'), true)
   check('显示按实际结构列', flat.includes('按你的结构'), true)
   check('显示历史构成', flat.includes('你的历史构成'), true)
+  // 换算口径：按账本实际峰谷均价折算，并给出费用构成。
+  // 回归点：「按你的结构」曾固定按谷时价算，和「占月额度」差 1.67 倍。
+  check('显示实际均价', flat.includes('实际均价'), true)
+  check('显示费用构成', flat.includes('费用构成'), true)
+  check('按实际结构给出 token', flat.includes('6.8B'), true)
+  // 构成百分比保留一位小数：输出 0.478% 不能被四舍五入成 0%，
+  // 否则卡片会读成「输出不花钱」，与费用构成自相矛盾。
+  check('输出占比保留一位小数', flat.includes('输出 0.5%'), true)
+  const mixedTitles = []
+  walkTree(tree, (node) => {
+    if (node?.type === 'td' && node.props?.className === 'tu-qcap-mixed') {
+      mixedTitles.push(String(node.props?.title ?? ''))
+    }
+  })
+  check('混合列提示覆盖三个窗口', mixedTitles.length === 3, mixedTitles.length)
+  check('混合列提示含谷时上界与峰时下界',
+    mixedTitles.some((title) => title.includes('谷时上界') && title.includes('峰时下界')), mixedTitles[0])
+  // 回归点：曾经拿账户月 98% 去除单模型的 $100 预算，算出「剩 2% ≈ 228M」。
+  check('混合列提示区分模型与账户剩余',
+    mixedTitles.some((title) => title.includes('该模型剩') && title.includes('账户剩')), mixedTitles[0])
+  check('月度提示用该模型自己的百分比', mixedTitles.some((title) => title.includes('43.6%')), mixedTitles.join(' / '))
+  check('月度提示带账户百分比作对照', mixedTitles.some((title) => title.includes('账户剩 2%')), mixedTitles.join(' / '))
   // 切回统计页，避免影响后续断言
   renderWithTab('统计')
 }

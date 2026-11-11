@@ -196,6 +196,25 @@ export function emptyCounters() {
   return { calls: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }
 }
 
+/**
+ * 计数器 + 成本的空值。
+ *
+ * 按 token 类型分记成本，是为了「单模型额度换算」能算每类的**实际均价**
+ * （按每个 10 分钟桶所在时刻的峰/谷价加权），从而和页头「占月额度」用同一
+ * 把尺子。只记总额的话，峰谷差价会被平均掉，换算出来的 token 数会虚高。
+ */
+function emptyCostCounters() {
+  return {
+    ...emptyCounters(),
+    /** 按桶内实际峰谷价累计的 list cost（美元）。 */
+    listCost: 0,
+    costInput: 0,
+    costOutput: 0,
+    costCacheRead: 0,
+    costCacheWrite: 0,
+  }
+}
+
 export function addCounters(target, source) {
   target.calls += Number(source?.calls) || 0
   target.inputTokens += Number(source?.inputTokens) || 0
@@ -279,50 +298,141 @@ export function factorFor(model, planId, factors = {}) {
  * 单模型额度换算：假设只用这一个模型，某窗口的额度能买多少 token。
  *
  * 额度预算 = 月额度 × 窗口释放比例（5h 20% / 周 50% / 月 100%）。
- * 纯输入 / 纯输出 / 纯缓存读是三种极端；「按你的结构」用该模型最近 30 天
- * 的真实 token 构成折算，更接近实际能跑多少。
  *
- * DeepSeek 有峰谷价：这里按**谷时**算（token 数最多），峰时数字减半，
- * 页面会提示。Grok / GPT 等有长上下文档位的模型按低档价，页面同样提示。
+ * ## 定价口径
+ *
+ * 每类 token 的单价优先用**账本自己的时间加权均价**：
+ * `Σ(按桶内实际峰/谷价计的成本) / Σtoken`。这和页头「占月额度」是同一把
+ * 尺子，所以 `tokens.mixed × 该均价` 恰好等于窗口预算。
+ * 没有历史构成（拿不到成本）时退回谷时价，`basis` 标成 `'off-peak'`；
+ * 此时界面会提示峰时减半。
+ *
+ * `windows[].bounds` 始终给出全谷时上界与全峰时下界，供界面悬停对照。
+ *
+ * `composition.costShare` 是各类 token 占了多少钱：DeepSeek 上缓存读占
+ * token 的 98%，但输出单价是缓存读的 200 倍，费用其实是三等分——只看
+ * token 比例会严重高估能跑的 token 数。
+ *
+ * ## 剩余额度
+ *
+ * `remaining.percent` / `remaining.tokens` 是**该模型自己**的窗口预算余额
+ * （与「占月额度」同源），`remaining.sitePercent` 是账户级窗口余额（所有模型
+ * 共用）。两者不能混用：账户 98% 不代表这个模型的 $100 月度额度用掉了 98%。
+ * 账户余额只给百分比，不再折算成 token——「账户 2% × 本模型预算」没有意义。
+ *
+ * Grok / GPT 等有长上下文档位的模型按低档价，页面会提示。
  */
-export function modelCapacity({ model, composition, planId = 'go', factors = {}, percents = {} }) {
+export function modelCapacity({
+  model, composition, planId = 'go', factors = {}, percents = {}, modelPercents = {},
+}) {
   const rate = RATES[model]
   if (rate === undefined) return undefined
   const cap = Number(capsFor(planId, factors)[model] ?? rate.cap)
   if (!(cap > 0)) return undefined
-  const base = rate.off !== undefined
+
+  // 谷时价 / 峰时价。峰谷模型（目前只有 DeepSeek）两者不同，其余模型相同。
+  const offRate = rate.off !== undefined
     ? { ...rate.off, cacheWrite: rate.cacheWrite ?? 0 }
     : rate
-  const total = composition === null || composition === undefined
+  // 只配了 `off` 没配 `peak` 的模型（外部扩展价目时可能出现）按谷时价当峰时价：
+  // 否则 `peak: true` 但上下界缺一半，界面会给出空提示。
+  const peakRate = rate.off === undefined
+    ? offRate
+    : { ...(rate.peak ?? rate.off), cacheWrite: rate.cacheWrite ?? 0 }
+
+  const TYPES = ['input', 'output', 'cacheRead', 'cacheWrite']
+  const TOKEN_FIELDS = {
+    input: 'inputTokens', output: 'outputTokens',
+    cacheRead: 'cacheReadTokens', cacheWrite: 'cacheWriteTokens',
+  }
+  const COST_FIELDS = {
+    input: 'costInput', output: 'costOutput',
+    cacheRead: 'costCacheRead', cacheWrite: 'costCacheWrite',
+  }
+  const source = composition ?? null
+  const tokens = {}
+  const costs = {}
+  for (const type of TYPES) {
+    tokens[type] = Number(source?.[TOKEN_FIELDS[type]]) || 0
+    costs[type] = Number(source?.[COST_FIELDS[type]]) || 0
+  }
+  const total = source === null
     ? 0
-    : Number(composition.tokens)
-      || (Number(composition.inputTokens) || 0)
-        + (Number(composition.outputTokens) || 0)
-        + (Number(composition.cacheReadTokens) || 0)
-        + (Number(composition.cacheWriteTokens) || 0)
-  const weight = total > 0
-    ? ((composition.inputTokens ?? 0) * (base.input ?? 0)
-      + (composition.outputTokens ?? 0) * (base.output ?? 0)
-      + (composition.cacheReadTokens ?? 0) * (base.cacheRead ?? 0)
-      + (composition.cacheWriteTokens ?? 0) * (base.cacheWrite ?? 0)) / total
-    : 0
+    : Number(source.tokens) || TYPES.reduce((sum, type) => sum + tokens[type], 0)
+  const ledgerCost = Number(source?.listCost) || 0
+  const typedCost = TYPES.reduce((sum, type) => sum + costs[type], 0)
+  // 各类都要有 token 与成本，才能算该类的实际均价；缺任何一项就整体退回谷时价。
+  const actual = total > 0 && ledgerCost > 0 && typedCost > 0
+
+  /** 某类 token 的实际均价（$/token）；没有账本成本时用给定价目。 */
+  const priceOf = (type, prices) => (actual && tokens[type] > 0 && costs[type] > 0
+    ? costs[type] / tokens[type]
+    : (prices[type] ?? 0))
+
+  /** 按构成加权的混合均价（$/token）。 */
+  const mixPrice = (prices) => (total > 0
+    ? TYPES.reduce((sum, type) => sum + tokens[type] * (prices[type] ?? 0), 0) / total
+    : 0)
+
+  const actualRates = {}
+  for (const type of TYPES) actualRates[type] = priceOf(type, offRate)
+  const offWeight = mixPrice(offRate)
+  const peakWeight = mixPrice(peakRate)
+  const weight = actual ? ledgerCost / total : offWeight
+
+  // 各类 token 的花费占比。有账本成本就用真实成本；否则按谷时价估。
+  // DeepSeek 的峰时价是谷时的等倍数，所以两种口径下占比一致。
+  let costShare
+  if (total > 0) {
+    const spent = TYPES.reduce((sum, type) => sum
+      + (actual ? costs[type] : tokens[type] * (offRate[type] ?? 0)), 0)
+    if (spent > 0) {
+      costShare = {}
+      for (const type of TYPES) {
+        costShare[type] = (actual ? costs[type] : tokens[type] * (offRate[type] ?? 0)) / spent
+      }
+    }
+  }
+
   const windows = WINDOWS.map((def) => {
     const budget = cap * def.share
-    const percent = Number(percents[def.key])
-    const remainingRatio = Number.isFinite(percent) ? Math.max(0, 1 - percent / 100) : undefined
+    const perToken = (price) => (price > 0 ? budget / price : undefined)
+    const sitePercent = Number(percents[def.key])
+    const modelPercent = Number(modelPercents[def.key])
+    const ratioOf = (value) => (Number.isFinite(value) ? Math.max(0, 1 - value / 100) : undefined)
+    const modelRatio = ratioOf(modelPercent)
+    const siteRatio = ratioOf(sitePercent)
     return {
       key: def.key,
       share: def.share,
       budget,
       tokens: {
-        input: base.input > 0 ? budget / base.input : undefined,
-        output: base.output > 0 ? budget / base.output : undefined,
-        cacheRead: base.cacheRead > 0 ? budget / base.cacheRead : undefined,
-        mixed: weight > 0 ? budget / weight : undefined,
+        input: perToken(actual ? actualRates.input : offRate.input),
+        output: perToken(actual ? actualRates.output : offRate.output),
+        cacheRead: perToken(actual ? actualRates.cacheRead : offRate.cacheRead),
+        mixed: perToken(weight),
       },
-      remaining: remainingRatio === undefined ? undefined : {
-        percent: Math.round(remainingRatio * 1000) / 10,
-        tokens: weight > 0 ? (budget * remainingRatio) / weight : undefined,
+      /** 全谷时上界 / 全峰时下界：实际值一定落在两者之间。 */
+      bounds: {
+        offPeak: {
+          input: perToken(offRate.input),
+          output: perToken(offRate.output),
+          cacheRead: perToken(offRate.cacheRead),
+          mixed: perToken(offWeight),
+        },
+        peak: {
+          input: perToken(peakRate.input),
+          output: perToken(peakRate.output),
+          cacheRead: perToken(peakRate.cacheRead),
+          mixed: perToken(peakWeight),
+        },
+      },
+      remaining: {
+        percent: modelRatio === undefined ? undefined : Math.round(modelRatio * 1000) / 10,
+        tokens: modelRatio === undefined ? undefined : (weight > 0 ? (budget * modelRatio) / weight : undefined),
+        // 账户级只给百分比：它管的是整个订阅，按本模型预算折 token 会重新
+        // 引入「哪把尺子」的混淆。
+        sitePercent: siteRatio === undefined ? undefined : Math.round(siteRatio * 1000) / 10,
       },
     }
   })
@@ -330,9 +440,20 @@ export function modelCapacity({ model, composition, planId = 'go', factors = {},
     model,
     cap,
     factor: factorFor(model, planId, factors),
+    /** `actual` = 按你的实际峰谷分布计价；`off-peak` = 没有构成，退回谷时价。 */
+    basis: actual ? 'actual' : 'off-peak',
     composition: total > 0
-      ? { ...composition, tokens: total, calls: Math.round(composition.calls ?? 0) }
+      ? {
+        ...composition,
+        tokens: total,
+        calls: Math.round(composition.calls ?? 0),
+        costShare,
+      }
       : null,
+    /** 实际均价（$/token），界面按 $/M 展示。 */
+    rates: actual ? { ...actualRates } : { ...offRate },
+    /** 按构成加权的混合均价（$/token）：窗口预算 ÷ 它就是 `tokens.mixed`。 */
+    weight,
     peak: rate.off !== undefined,
     tiered: TIERED_MODELS.has(model),
     windows,
@@ -543,6 +664,9 @@ export class QuotaLedger {
    *
    * 窗口起点所在的桶按重叠比例摊分；其余桶整桶计入——桶内记录本身就是
    * 真实发生的量，不能再按时间比例缩小。
+   *
+   * 除了计数器与总额 `listCost`，还按 token 类型分记成本：单模型额度换算
+   * 要用「Σ成本 / Σtoken」作为该类的实际均价，峰谷差异才不会被平均掉。
    */
   usageBetween(provider, start, end) {
     const models = {}
@@ -560,9 +684,19 @@ export class QuotaLedger {
         if (owner !== provider) continue
         const model = slash === -1 ? key : key.slice(slash + 1)
         const scaled = ratio >= 1 ? counters : scaleCounters(counters, ratio)
-        const target = models[model] ??= { ...emptyCounters(), listCost: 0 }
+        const target = models[model] ??= emptyCostCounters()
         addCounters(target, scaled)
-        target.listCost += listCostOf(model, scaled, bucket)
+        const rate = rateAt(model, bucket)
+        if (rate === undefined) continue
+        const costInput = scaled.inputTokens * (rate.input ?? 0)
+        const costOutput = scaled.outputTokens * (rate.output ?? 0)
+        const costCacheRead = scaled.cacheReadTokens * (rate.cacheRead ?? 0)
+        const costCacheWrite = scaled.cacheWriteTokens * (rate.cacheWrite ?? 0)
+        target.costInput += costInput
+        target.costOutput += costOutput
+        target.costCacheRead += costCacheRead
+        target.costCacheWrite += costCacheWrite
+        target.listCost += costInput + costOutput + costCacheRead + costCacheWrite
       }
     }
     return models
@@ -768,14 +902,34 @@ export class QuotaLedger {
       })
     }
     // —— 单模型额度换算 ——
-    // 构成取最近 30 天（覆盖月窗口）；没有用量的模型只给三种极端值。
+    // 构成取**月窗口**区间，和「占月额度」完全同源（月窗口 = resetsAt - 30d）。
+    // 缺月窗口采样时退回最近 30 天；没有用量的模型只给三种极端值。
+    const monthDef = defs.find((item) => item.key === 'monthly')
+    const compositionStart = monthDef?.startAt ?? (now - 30 * 86400 * 1000)
     const composition = provider === undefined
       ? {}
-      : this.usageBetween(provider, now - 30 * 86400 * 1000, now)
+      : this.usageBetween(provider, compositionStart, now)
     const capsForPlan = caps
+    // 账户级窗口百分比（所有模型共用）。
     const percents = {}
+    // 该模型自己的窗口消耗百分比：listCost / (月额度 × 窗口释放比例)。
+    // 与模型表里的「占月额度」同源，卡片据此算剩余，避免拿账户 98% 去套
+    // 单个模型的 $100 预算。
+    const modelPercents = {}
     for (const item of defs) {
       if (item.percent !== undefined) percents[item.key] = item.percent
+      const perModel = {}
+      for (const row of item.models) {
+        // 与表格 monthlyUsedPct 同一判据：只有该档位真的给出这个模型的月额度
+        // 才算百分比，未校准的档位（Plus/Teams 只测了锚点模型）保持为空，
+        // 否则卡片会显示出一个表格上是「—」的百分比。
+        const modelCap = Number(capsForPlan[row.model])
+        const budget = modelCap * item.share
+        if (Number.isFinite(modelCap) && modelCap > 0 && budget > 0) {
+          perModel[row.model] = (row.listCost / budget) * 100
+        }
+      }
+      modelPercents[item.key] = perModel
     }
     const catalog = []
     const modelCapacityMap = {}
@@ -783,12 +937,18 @@ export class QuotaLedger {
       const cap = Number(capsForPlan[model] ?? RATES[model].cap)
       if (!(cap > 0)) continue
       catalog.push({ model, cap, factor: factorFor(model, planId, this.state.factors) })
+      const usedPercent = {}
+      for (const item of defs) {
+        const value = modelPercents[item.key]?.[model]
+        if (Number.isFinite(value)) usedPercent[item.key] = value
+      }
       modelCapacityMap[model] = modelCapacity({
         model,
         composition: composition[model] ?? null,
         planId,
         factors: this.state.factors,
         percents,
+        modelPercents: usedPercent,
       })
     }
     catalog.sort((a, b) => (b.cap - a.cap) || a.model.localeCompare(b.model))
