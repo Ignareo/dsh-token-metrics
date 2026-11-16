@@ -159,6 +159,11 @@ const quotaResponse = {
         calls: 488, tokens: 79_500_000, inputTokens: 1_350_000, outputTokens: 380_000,
         cacheReadTokens: 77_770_000, cacheWriteTokens: 0,
         costShare: { input: 0.338, output: 0.336, cacheRead: 0.326, cacheWrite: 0 },
+        // 峰谷分布：费用八成在峰价、token 六成多在峰价——「均价为什么高」的答案。
+        peakSplit: {
+          cost: { peak: 0.804, off: 0.196 },
+          tokens: { peak: 0.631, off: 0.369 },
+        },
       },
       windows: [
         {
@@ -2249,6 +2254,10 @@ const discoveredEntry = () => ({
   // 回归点：「按你的结构」曾固定按谷时价算，和「占月额度」差 1.67 倍。
   check('显示实际均价', flat.includes('实际均价'), true)
   check('显示费用构成', flat.includes('费用构成'), true)
+  // 峰谷分布：有峰谷价的模型必须说明峰价 / 谷价各占几成（费用与 token 两个口径）。
+  check('显示峰谷分布', flat.includes('峰谷分布'), true)
+  check('峰谷分布含按费用', flat.includes('按费用 峰价 80.4%') && flat.includes('谷价 19.6%'), true)
+  check('峰谷分布含按 token', flat.includes('按 token 峰价 63.1%') && flat.includes('谷价 36.9%'), true)
   check('按实际结构给出 token', flat.includes('6.8B'), true)
   // 构成百分比保留一位小数：输出 0.478% 不能被四舍五入成 0%，
   // 否则卡片会读成「输出不花钱」，与费用构成自相矛盾。

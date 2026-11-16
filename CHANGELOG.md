@@ -41,6 +41,11 @@
   `cost.todayByModel` / `cost.todayByProvider`，峰谷价差不再被按比例折算抹平；
   未定价模型显示「未定价」而不是假 0。
   设计与数据口径见 `docs/floating-widget-design.md`
+- **换算卡片新增「峰谷分布」**：有峰谷价的模型（DeepSeek）说明费用与 token
+  里峰价 / 谷价各占几成（`composition.peakSplit`）。峰谷价差是「均价为什么
+  比谷时价高」的直接原因——例如实测一处：按费用峰价 61.4% / 谷价 38.6%，
+  按 token 峰价 43.4% / 谷价 56.6%，实际均价 $0.0125/M，正好落在谷时上界
+  11.55B 与峰时下界 5.77B 之间
 
 ### 修复
 

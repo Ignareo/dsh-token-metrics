@@ -290,6 +290,11 @@ window.__ModuleLoader__.load({
       'quota.capacityMixed': '按你的结构',
       'quota.capacityComposition': '你的历史构成',
       'quota.capacityCostShare': '费用构成',
+      'quota.capacityPeakSplit': '峰谷分布',
+      'quota.capacityPeakPrice': '峰价',
+      'quota.capacityOffPrice': '谷价',
+      'quota.capacityByCost': '按费用',
+      'quota.capacityByToken': '按 token',
       'quota.capacityNoComposition': '没有这个模型的历史调用，先看三种极端值；跑几次后这里会按你的实际构成与峰谷分布折算',
       'quota.capacityPeak': 'DeepSeek 峰时（UTC 01–04 / 06–10）表中 token 数减半',
       'quota.capacityPeakActual': 'DeepSeek 峰谷价（UTC 01–04 / 06–10）已按你的实际时段折算',
@@ -832,6 +837,11 @@ window.__ModuleLoader__.load({
       'quota.capacityMixed': 'Your mix',
       'quota.capacityComposition': 'Your composition',
       'quota.capacityCostShare': 'Cost split',
+      'quota.capacityPeakSplit': 'Peak/off-peak split',
+      'quota.capacityPeakPrice': 'peak',
+      'quota.capacityOffPrice': 'off-peak',
+      'quota.capacityByCost': 'by cost',
+      'quota.capacityByToken': 'by token',
       'quota.capacityNoComposition': 'No history for this model yet — the three extremes are shown; once you use it, this table follows your actual mix and peak/off-peak hours',
       'quota.capacityPeak': 'DeepSeek peak hours (UTC 01–04 / 06–10) halve these token counts',
       'quota.capacityPeakActual': 'DeepSeek peak pricing (UTC 01–04 / 06–10) is already reflected for your hours',
@@ -6791,6 +6801,23 @@ function formatMoneyText(value) {
           ? null
           : `${t('quota.capacityCostShare')}：${t('quota.capacityInput')} ${pct(costShare.input * 100)} · ${t('quota.capacityOutput')} ${pct(costShare.output * 100)} · ${t('quota.capacityCache')} ${pct(costShare.cacheRead * 100)}`
             + (costShare.cacheWrite > 0 ? ` · ${t('quota.capacityWrite')} ${pct(costShare.cacheWrite * 100)}` : '')
+        // 峰谷分布用一位小数：63.4% / 36.6% 这种差别要看得出来。
+        const pct1 = (value) => {
+          const n = Number(value)
+          if (!Number.isFinite(n)) return '—'
+          return `${Math.round(n * 10) / 10}%`
+        }
+        const split = comp?.peakSplit
+        const peakSplitText = capacity.peak !== true || split === undefined
+          ? null
+          : [
+            split.cost === undefined
+              ? null
+              : `${t('quota.capacityByCost')} ${t('quota.capacityPeakPrice')} ${pct1(split.cost.peak * 100)} · ${t('quota.capacityOffPrice')} ${pct1(split.cost.off * 100)}`,
+            split.tokens === undefined
+              ? null
+              : `${t('quota.capacityByToken')} ${t('quota.capacityPeakPrice')} ${pct1(split.tokens.peak * 100)} · ${t('quota.capacityOffPrice')} ${pct1(split.tokens.off * 100)}`,
+          ].filter(Boolean).join(' ｜ ')
         const cell = (value) => (Number.isFinite(value) ? formatCompact(value) : '—')
         // 宿主先升级、客户端还是旧版（或反之）时，payload 里没有 basis：
         // 此时 remaining 仍是旧宿主算的账户口径，标签不能写「该模型剩」。
@@ -6868,6 +6895,10 @@ function formatMoneyText(value) {
           ),
           h('div', { className: 'tu-qcap-note' }, compositionText),
           costText === null ? null : h('div', { className: 'tu-qcap-note' }, costText),
+          peakSplitText === null
+            ? null
+            : h('div', { className: 'tu-qcap-note' },
+              `${t('quota.capacityPeakSplit')}：${peakSplitText}`),
           capacity.tiered ? h('div', { className: 'tu-qcap-note' }, t('quota.capacityTier')) : null,
         )
       }

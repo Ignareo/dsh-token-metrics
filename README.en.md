@@ -43,7 +43,9 @@ provider-balance management.
   ledger's own peak/off-peak weighted average (the same ruler as the monthly-cap
   column); off-peak caps and peak floors live in the tooltip, and the
   composition line also shows the **cost split** (cache reads are 98% of tokens
-  but output is 200x their unit price, so cost is roughly one third each)
+  but output is 200x their unit price, so cost is roughly one third each), and
+  peak-priced models (DeepSeek) report the **peak/off-peak split** — how much of
+  the cost and of the tokens was billed at peak price
 - The ledger is a separate 10-minute-bucket file, so `usage.json` writes do not
   grow; allowance is a **dollar quota**, not a token quota
 - Remaining quota is computed against **that model's own** budget; the

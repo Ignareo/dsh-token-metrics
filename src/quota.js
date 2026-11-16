@@ -212,6 +212,11 @@ function emptyCostCounters() {
     costOutput: 0,
     costCacheRead: 0,
     costCacheWrite: 0,
+    /** 峰价 / 谷价各花了多少（美元）与跑了多少 token：卡片用来报分布。 */
+    costPeak: 0,
+    costOff: 0,
+    tokensPeak: 0,
+    tokensOff: 0,
   }
 }
 
@@ -309,6 +314,9 @@ export function factorFor(model, planId, factors = {}) {
  *
  * `windows[].bounds` 始终给出全谷时上界与全峰时下界，供界面悬停对照。
  *
+ * `composition.peakSplit` 给出峰谷分布（`cost` / `tokens` 各含 peak、off 占比）：
+ * 峰价跑掉的钱和 token 各占几成，直接解释「均价为什么比谷时价高」。
+ *
  * `composition.costShare` 是各类 token 占了多少钱：DeepSeek 上缓存读占
  * token 的 98%，但输出单价是缓存读的 200 倍，费用其实是三等分——只看
  * token 比例会严重高估能跑的 token 数。
@@ -380,6 +388,24 @@ export function modelCapacity({
   const peakWeight = mixPrice(peakRate)
   const weight = actual ? ledgerCost / total : offWeight
 
+  // 峰谷分布：峰价 / 谷价各占了多少钱、多少 token。
+  // 只对峰谷价模型（`rate.off` 存在）有意义；账本没累计过就留空。
+  const shareOf = (peakValue, offValue) => {
+    const sum = peakValue + offValue
+    return sum > 0 ? { peak: peakValue / sum, off: offValue / sum } : undefined
+  }
+  const peakCost = Number(source?.costPeak) || 0
+  const offCost = Number(source?.costOff) || 0
+  const peakTokens = Number(source?.tokensPeak) || 0
+  const offTokens = Number(source?.tokensOff) || 0
+  const costSplit = shareOf(peakCost, offCost)
+  const tokenSplit = shareOf(peakTokens, offTokens)
+  const peakSplit = rate.off === undefined
+    ? undefined
+    : (costSplit === undefined && tokenSplit === undefined
+      ? undefined
+      : { cost: costSplit, tokens: tokenSplit })
+
   // 各类 token 的花费占比。有账本成本就用真实成本；否则按谷时价估。
   // DeepSeek 的峰时价是谷时的等倍数，所以两种口径下占比一致。
   let costShare
@@ -448,6 +474,7 @@ export function modelCapacity({
         tokens: total,
         calls: Math.round(composition.calls ?? 0),
         costShare,
+        peakSplit,
       }
       : null,
     /** 实际均价（$/token），界面按 $/M 展示。 */
@@ -667,6 +694,7 @@ export class QuotaLedger {
    *
    * 除了计数器与总额 `listCost`，还按 token 类型分记成本：单模型额度换算
    * 要用「Σ成本 / Σtoken」作为该类的实际均价，峰谷差异才不会被平均掉。
+   * 峰价桶与谷价桶的成本 / token 也分开累计，卡片据此报「峰价占几成」。
    */
   usageBetween(provider, start, end) {
     const models = {}
@@ -696,7 +724,18 @@ export class QuotaLedger {
         target.costOutput += costOutput
         target.costCacheRead += costCacheRead
         target.costCacheWrite += costCacheWrite
-        target.listCost += costInput + costOutput + costCacheRead + costCacheWrite
+        const cost = costInput + costOutput + costCacheRead + costCacheWrite
+        target.listCost += cost
+        // 峰谷分布：这一桶实际按峰价还是谷价计费，以及它跑了多少 token。
+        const tokensHere = scaled.inputTokens + scaled.outputTokens
+          + scaled.cacheReadTokens + scaled.cacheWriteTokens
+        if (rate.off !== undefined && isPeakTime(bucket)) {
+          target.costPeak += cost
+          target.tokensPeak += tokensHere
+        } else {
+          target.costOff += cost
+          target.tokensOff += tokensHere
+        }
       }
     }
     return models

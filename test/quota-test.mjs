@@ -148,6 +148,28 @@ close('剩余 = 该模型口径', dsMonth.remaining.percent, 43.6, 1e-9)
 close('剩余 token', dsMonth.remaining.tokens, (100 * 0.436) / (0.48 / 11_100_000), 1)
 close('账户剩余对照', dsMonth.remaining.sitePercent, 2, 1e-9)
 
+// 峰谷分布：这批构成没带峰值/谷值分项，卡片就不该报分布（不能拿 0 当 0%）。
+check('无峰谷分项时不给分布', dsActual.composition.peakSplit, undefined)
+
+// 带峰谷分项时：费用 2:1 峰、token 1:1。
+const splitComposition = {
+  calls: 100,
+  tokens: 2_000_000,
+  inputTokens: 2_000_000, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
+  listCost: 0.45, costInput: 0.45, costOutput: 0, costCacheRead: 0, costCacheWrite: 0,
+  costPeak: 0.30, costOff: 0.15,
+  tokensPeak: 1_000_000, tokensOff: 1_000_000,
+}
+const splitCapacity = modelCapacity({ model: 'deepseek-v4.1-flash', composition: splitComposition, planId: 'go' })
+close('费用峰价占比', splitCapacity.composition.peakSplit.cost.peak, 2 / 3, 1e-9)
+close('费用谷价占比', splitCapacity.composition.peakSplit.cost.off, 1 / 3, 1e-9)
+close('token 峰价占比', splitCapacity.composition.peakSplit.tokens.peak, 0.5, 1e-9)
+close('token 谷价占比', splitCapacity.composition.peakSplit.tokens.off, 0.5, 1e-9)
+// 峰谷分项要能还原总成本，否则占比会和「占月额度」对不上。
+close('峰谷成本之和 = listCost', splitComposition.costPeak + splitComposition.costOff, splitComposition.listCost, 1e-12)
+// 非峰谷模型不给分布（没有峰谷概念）。
+check('非峰谷模型不给分布', grokCapacity.composition.peakSplit, undefined)
+
 close('峰谷模型上下界不同', dsMonth.bounds.offPeak.mixed > dsMonth.bounds.peak.mixed, true)
 // 这批构成全在峰时，所以实际值正好等于峰时下界。
 checkTrue('峰谷模型实际落在区间内', dsMonth.tokens.mixed <= dsMonth.bounds.offPeak.mixed
@@ -227,6 +249,33 @@ close('分项成本之和 = listCost', dsCost.listCost,
   dsCost.costInput + dsCost.costOutput + dsCost.costCacheRead + dsCost.costCacheWrite, 1e-15)
 // GLM 没有峰谷价，同价目。
 close('GLM 输入成本', models['glm-5.3-flash'].costInput, 200 * 0.15e-6, 1e-15)
+
+// 峰谷分布：t1（09:30 北京）是峰时，峰价成本 = listCost、谷价成本 0；
+// 非峰谷模型的 token 全部算谷价（它没有峰价概念，占比只用来验证分母）。
+close('深寻峰价成本', dsCost.costPeak, dsCost.listCost, 1e-15)
+close('深寻谷价成本', dsCost.costOff, 0, 1e-15)
+close('深寻峰价 token', dsCost.tokensPeak, 1120, 1e-9)
+close('深寻谷价 token', dsCost.tokensOff, 0, 1e-9)
+
+// 再记一条谷时（12:00 北京 = 04:00 UTC，两个峰时窗口之间），验证分离。
+ledger.record({
+  time: Date.parse('2026-11-05T12:15:00+08:00'),
+  provider: 'opencode-go',
+  model: 'deepseek-v4.1-flash',
+  usage: { inputTokens: 400, outputTokens: 0, cacheReadTokens: 0 },
+})
+const splitModels = ledger.usageBetween('opencode-go',
+  bucketStart, Math.floor(Date.parse('2026-11-05T13:00:00+08:00') / BUCKET_MS) * BUCKET_MS)
+const dsSplit = splitModels['deepseek-v4.1-flash']
+// 峰时：100*0.30 + 20*1.20 + 1000*0.006 = $0.00006；谷时：400*0.15 = $0.00006。
+close('峰谷成本分别累计', dsSplit.costPeak, 60e-6, 1e-15)
+close('谷时成本累计', dsSplit.costOff, 60e-6, 1e-15)
+close('峰谷成本之和 = listCost', dsSplit.costPeak + dsSplit.costOff, dsSplit.listCost, 1e-15)
+close('峰谷 token 分别累计', dsSplit.tokensPeak, 1120, 1e-9)
+close('谷时 token 累计', dsSplit.tokensOff, 400, 1e-9)
+const splitCard = modelCapacity({ model: 'deepseek-v4.1-flash', composition: dsSplit, planId: 'go' })
+close('按费用峰价占比', splitCard.composition.peakSplit.cost.peak, 0.5, 1e-9)
+close('按 token 峰价占比', splitCard.composition.peakSplit.tokens.peak, 1120 / 1520, 1e-9)
 
 // 窗口起点落在桶中间：按重叠比例摊分。桶长 10 分钟，取后一半。
 const half = ledger.usageBetween('opencode-go', bucketStart + 5 * 60 * 1000, bucketStart + 10 * 60 * 1000)
