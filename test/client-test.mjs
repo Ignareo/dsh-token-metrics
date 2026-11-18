@@ -2280,6 +2280,86 @@ const discoveredEntry = () => ({
   renderWithTab('统计')
 }
 
+// —— 悬浮窗可隐藏（issue #10）——
+// 用户要求「用量悬浮窗支持自定义显示/不显示」。
+// 关键设计点：隐藏后必须还有地方能重新打开，否则点一次就永远找不回来了。
+{
+  const src = readFileSync(join(here, '..', 'client.js'), 'utf8')
+
+  // 默认显示：老用户升级后不该突然消失
+  check('默认配置 visible 为 true', /visible: true/.test(src), true)
+  check('读取时默认显示', /visible: parsed\.visible !== false/.test(src), true)
+
+  // 隐藏生效
+  check('渲染时判断 visible', /settings\.visible === false\) return null/.test(src), true)
+
+  // 两个入口：悬浮窗内隐藏 + 主面板开关（后者是唤回的唯一入口）
+  check('悬浮窗设置有隐藏按钮', /'widget\.hide'/.test(src), true)
+  check('主面板有显隐开关', /toggleWidgetVisible/.test(src), true)
+
+  // 跨组件同步：主面板切换后悬浮窗立即响应
+  check('有显隐同步事件', /WIDGET_VISIBLE_EVENT/.test(src), true)
+  check('悬浮窗监听该事件', /addEventListener\(WIDGET_VISIBLE_EVENT/.test(src), true)
+  check('主面板派发该事件', /dispatchEvent\(new CustomEvent\(WIDGET_VISIBLE_EVENT/.test(src), true)
+
+  // 中文文案齐全
+  for (const key of ['widget.hide', 'widget.hideHint', 'widget.on', 'widget.off']) {
+    check(`文案含 ${key}`, src.includes(`'${key}'`), true)
+  }
+}
+
+// —— 悬浮窗拖拽：折叠态也要能拖 ——
+// 回归点：pill（折叠成小药丸）早先只绑了 onClick（展开），没有 onPointerDown，
+// 折叠后无法拖动 —— 想换位置得先展开、拖、再折叠。
+// 且指针事件后浏览器还会派发 click，若不区分，拖动药丸会被当成点击而展开。
+{
+  const src = readFileSync(join(here, '..', 'client.js'), 'utf8')
+
+  // 折叠态支持拖拽 + 点击展开（两者靠移动距离区分）
+  const pillStart = src.indexOf("const pill = h('div', {")
+  const pillBlock = pillStart === -1 ? '' : src.slice(pillStart, pillStart + 1400)
+  const pillProps = [...pillBlock.matchAll(/\n\s{6,10}(\w+):/g)].map((m) => m[1])
+  check('pill 绑定 onPointerDown', pillProps.includes('onPointerDown'),
+    `实际属性: ${pillProps.join(',')}`)
+  check('pill 有 onClick 展开', pillProps.includes('onClick'), true)
+  check('有独立的 onPillPointerDown', /const onPillPointerDown = /.test(src), true)
+  check('pill 用独立 handler', /onPointerDown: onPillPointerDown/.test(src), true)
+  check('有 dragJustEndedRef 标记', /const dragJustEndedRef = useRef\(false\)/.test(src), true)
+  check('click 里消费标记', /dragJustEndedRef\.current = false/.test(src), true)
+
+  // 关键回归：标记必须**只吞一次** click。
+  // 早先写成「pillDraggingRef 或 dragJustEndedRef 任一为真就 return 并复位」，
+  // 导致拖过一次之后再也点不开（因为 pillDraggingRef 为真时也复位了标记）。
+  {
+    let dragJustEnded = false
+    let collapsed = false
+    const onClick = () => {
+      if (dragJustEnded) { dragJustEnded = false; return }
+      collapsed = true
+    }
+    dragJustEnded = true
+    onClick()
+    // 真值断言：否定条件要取反
+    check('拖后那次 click 被吞', collapsed === false, `实际 collapsed=${collapsed}`)
+    collapsed = false
+    onClick()
+    check('再次点击能正常展开', collapsed, true)
+  }
+  check('药丸拖拽按自身尺寸钳制', /overlayRect\.height - start\.height - 8/.test(src), true)
+
+  // 拖拽保持 0.4.0 的简单实现：不加额外监听器，避免残留导致卡死
+  check('拖拽用 window 监听并成对移除',
+    /window\.addEventListener\('pointerup', onUp\)/.test(src)
+    && /window\.removeEventListener\('pointerup', onUp\)/.test(src), true)
+  check('无额外兜底监听器残留风险', !src.includes('const safetyUp'))
+
+  // 回退到 0.4.0：不再自造 overlay 兜底，保持原有行为
+  check('拖拽用原始 overlay 查找', /const overlay = root\?\.closest\?\.\('\[data-shell-overlay\]'\)/.test(src), true)
+
+  // 折叠态光标
+  check('pill 有 grab 光标', /\.tu-float-pill \{[\s\S]{0,300}?cursor: grab/.test(src), true)
+}
+
 if (failures.length > 0) {
   if (componentErrors.length > 0) {
     console.error('组件抛错：')

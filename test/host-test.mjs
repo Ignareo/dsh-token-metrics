@@ -576,6 +576,65 @@ check('失败计数仍在内部累计', diskTracker.store.failedAttempts.count, 
 check('磁盘回扫读到会话标题', diskTracker.store.bySession['session-disk-1']?.title, '磁盘会话')
 rmSync(diskHome, { recursive: true, force: true })
 
+// —— 多帧 zstd：真实会话日志是逐段追加的多帧，只解第一帧会漏掉全部用量 ——
+// DSH 每追加一批事件就压一个独立帧写进同一个文件。zstdDecompressSync(raw)
+// 只解第一帧（通常是一百多字节的 session header），后面所有 assistant/message
+// 都读不到 —— 这正是「当天用量显示为 0、历史总额却非零」的成因。
+// 这里故意把日志压成多帧，锁死逐帧解压的行为。
+const multiFrameHome = freshEnvironment('dsh-token-metrics-multiframe-')
+process.env.DSH_TOKEN_USAGE_TEST_HOOK = '1'
+const multiFrameSessions = join(multiFrameHome, 'sessions', 'proj-mf', 'session-mf-1')
+mkdirSync(multiFrameSessions, { recursive: true })
+const multiFrameHeader = {
+  type: 'session', version: 4, id: 'session-mf-1',
+  createdAt: Date.now(), cwd: '/proj/multiframe', isSeeded: false, delegationDepth: 0,
+}
+const multiFrameEvents = [
+  { type: 'assistant/message', seq: 0, time: Date.now() - 3000, data: { turn: 1, step: 1, message: { source: { provider: 'mfprov', model: 'mfmodel' } }, usage: { inputTokens: 700, outputTokens: 70, totalTokens: 770, cacheReadTokens: 300 } } },
+  { type: 'assistant/message', seq: 1, time: Date.now() - 2000, data: { turn: 1, step: 2, message: { source: { provider: 'mfprov', model: 'mfmodel' } }, usage: { inputTokens: 200, outputTokens: 50, totalTokens: 250 } } },
+  { type: 'assistant/message', seq: 2, time: Date.now() - 1000, data: { turn: 1, step: 3, message: { source: { provider: 'mfprov', model: 'mfmodel' } }, usage: { inputTokens: 100, outputTokens: 30, totalTokens: 130 } } },
+]
+const zstdMulti = await import('node:zlib')
+// 关键：header 单独一帧，之后每条事件各压一帧 —— 共 4 帧。
+const multiFrameBuffer = Buffer.concat([
+  zstdMulti.zstdCompressSync(Buffer.from(JSON.stringify(multiFrameHeader) + '\n', 'utf8')),
+  ...multiFrameEvents.map((event) => zstdMulti.zstdCompressSync(Buffer.from(JSON.stringify(event) + '\n', 'utf8'))),
+])
+writeFileSync(join(multiFrameSessions, 'session.v4.jsonl.zstd'), multiFrameBuffer)
+/**
+ * 前置自检：确认这份样本确实是**多帧** zstd。
+ *
+ * 注意**不能断言「一次性解压只拿到 1 行」** —— 那是 Node 26 的行为：
+ * Node 24 的 `zstdDecompressSync` 会解出全部帧（实测一行不漏）。用这种
+ * 版本相关行为做断言，会让同一份代码在 Node 24 的 CI 上失败（真发生过）。
+ *
+ * 改为检查**帧结构本身**：是否存在 ≥2 个 zstd 帧魔数。这与 Node 版本无关，
+ * 且正是「线上日志是多帧追加写」的客观特征。
+ */
+const ZSTD_MAGIC = Buffer.from([0x28, 0xb5, 0x2f, 0xfd])
+let frameCount = 0
+let scanAt = 0
+while ((scanAt = multiFrameBuffer.indexOf(ZSTD_MAGIC, scanAt)) !== -1) {
+  frameCount += 1
+  scanAt += 4
+}
+check('多帧样本：确实包含多个 zstd 帧', frameCount >= 4, true)
+const multiFrameModule = await import('../index.js?multiframe=1')
+multiFrameModule.apply({
+  logger: { info: (m) => warnings.push('INFO ' + m), warn: (m) => warnings.push('WARN ' + m) },
+  on() { return () => {} },
+  effect(fn) { fn(); return () => {} },
+  inject() { return () => {} },
+  get() { return undefined },
+}, { snapshotCacheMs: 0 })
+await new Promise((resolve) => setTimeout(resolve, 4000))
+const multiFrameTracker = globalThis[Symbol.for('dsh-token-metrics:tracker')]
+const multiFrameSnap = multiFrameTracker.snapshot()
+check('多帧回扫补录到全部调用', multiFrameSnap.totals.all.calls, 3)
+check('多帧回扫 token 正确', multiFrameSnap.totals.all.totalTokens, 1150)
+check('多帧回扫识别供应商', multiFrameSnap.byProvider.mfprov?.calls, 3)
+rmSync(multiFrameHome, { recursive: true, force: true })
+
 // —— 新维度：项目 / 来源 / 账号 / 失败请求 ——
 const dimHome = freshEnvironment('dsh-token-metrics-dims-')
 process.env.DSH_TOKEN_USAGE_TEST_HOOK = '1'

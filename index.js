@@ -61,7 +61,7 @@ export const name = 'dsh-token-metrics'
  * selfReload 在激活前会拿它和「期望版本」比对，确保替换上去的确实是新代码，
  * 而不是缓存里的旧对象。因此这个值必须跟着 package.json 一起更新。
  */
-export const version = '0.4.0'
+export const version = '0.4.2'
 
 /** 本包目录（file:// URL，带尾斜杠），热重载与自更新用它定位文件。 */
 const PACKAGE_URL = new URL('./', import.meta.url).href
@@ -2014,6 +2014,20 @@ function collectSessionFiles(root) {
 function readSessionLog(file) {
   const raw = readFileSync(file)
   if (typeof zstdDecompressSync === 'function') {
+    /**
+     * 采用 src/zstd.js 的实现在**多帧**日志上解压。
+     *
+     * 为什么不用 zstdDecompressSync(raw) 一次解完：会话日志是多帧追加写的，
+     * 该 API 只解第一帧（一百多字节的 session header），后续帧全丢 ——
+     * 实测一份真实文件：一次解压 285 字符 / 0 条 assistant/message，
+     * 逐帧解压 424,886 字符 / 25 条。
+     *
+     * 为什么不用「按 engine.bytesWritten 推进」的简单写法：Node 对**截断帧
+     * 不抛错**，而是静默返回 0 字节且 bytesWritten 非零。遇到中间帧损坏时
+     * 那种写法会无声停止，后续所有帧都读不到。src/zstd.js 用「解到文件尾
+     * 得完整结果，再用候选切点做长度+内容比对」来鉴别真帧边界，损坏帧也能
+     * 保住其后的帧。
+     */
     try {
       const text = decompressZstdFrames(raw).toString('utf8')
       if (text !== '') return text
@@ -2027,6 +2041,7 @@ function readSessionLog(file) {
     return ''
   }
 }
+
 
 /** 把日志文本解析成 header + 事件列表。 */
 function parseSessionLog(text) {

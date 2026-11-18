@@ -84,6 +84,14 @@ window.__ModuleLoader__.load({
     const WIDGET_QUOTA_PLATFORMS = new Set(['kimi', 'glm', 'minimax', 'codex', 'mimo', 'opencode-go'])
     /** 打开统计页 / 模型接入页的跨组件事件。 */
     const WIDGET_VIEW_EVENT = 'dsh-token-metrics:view'
+    /**
+     * 悬浮窗显隐变更事件。
+     *
+     * 主面板与悬浮窗是两个独立的 slot 组件，各自持有 settings 状态。
+     * 主面板里切换开关后，悬浮窗必须立刻响应 —— 否则用户点了「显示」
+     * 却要刷新页面才看到，体验是断的。
+     */
+    const WIDGET_VISIBLE_EVENT = 'dsh-token-metrics:widget-visible'
   /**
    * 各家服务的预设连接信息。
    *
@@ -702,12 +710,20 @@ window.__ModuleLoader__.load({
       'widget.collapse': '收起',
       'widget.expand': '展开',
       'widget.closeSettings': '关闭设置',
+      'widget.hide': '隐藏悬浮窗',
+      'widget.hideHint': '隐藏后可从统计页头部的「悬浮窗」按钮重新打开',
+      'widget.hideTip': '点击隐藏悬浮窗',
+      'widget.showTip': '点击显示悬浮窗',
+      'widget.on': '悬浮窗 ✓',
+      'widget.off': '悬浮窗 ✕',
+
       'widget.left': '剩余',
       'widget.scope': '统计范围',
       'widget.scopeSelected': '所选供应商',
       'widget.scopeAll': '全部',
       'widget.quotaMain': '主窗口',
       'widget.dragHint': '拖动标题可移动；双击恢复自动避让',
+      'widget.pillHint': '点击展开；按住可拖动',
       'widget.noSitesHint': '勾选后才会显示',
       'widget.loading': '读取中…',
       'widget.offline': '离线',
@@ -1249,12 +1265,20 @@ window.__ModuleLoader__.load({
       'widget.collapse': 'Collapse',
       'widget.expand': 'Expand',
       'widget.closeSettings': 'Close settings',
+      'widget.hide': 'Hide widget',
+      'widget.hideHint': 'Reopen it from the "Widget" button in the stats page header',
+      'widget.hideTip': 'Hide the floating widget',
+      'widget.showTip': 'Show the floating widget',
+      'widget.on': 'Widget ✓',
+      'widget.off': 'Widget ✕',
+
       'widget.left': 'left',
       'widget.scope': 'Scope',
       'widget.scopeSelected': 'Selected',
       'widget.scopeAll': 'All',
       'widget.quotaMain': 'Main window',
       'widget.dragHint': 'Drag the header to move; double-click to restore auto-avoid',
+      'widget.pillHint': 'Click to expand; drag to move',
       'widget.noSitesHint': 'Check a provider to show it',
       'widget.loading': 'Loading…',
       'widget.offline': 'Offline',
@@ -3962,6 +3986,9 @@ body[data-ds-dark-theme] .tu-toasts,
 .tu-float[data-dragging='true'] {
   transition: none;
 }
+.tu-float[data-dragging='true'] .tu-float-pill {
+  cursor: grabbing;
+}
 .tu-float-card {
   border: 1px solid var(--dsw-alias-border-l2);
   border-radius: 15px;
@@ -4246,6 +4273,10 @@ body[data-ds-dark-theme] .tu-float-card,
   display: inline-flex;
   align-items: center;
   gap: 8px;
+  /* 折叠态现在也支持拖动，光标与触屏行为要和展开态的标题栏一致 */
+  cursor: grab;
+  user-select: none;
+  touch-action: none;
   padding: 7px 12px 7px 10px;
   border: 1px solid var(--dsw-alias-border-l2);
   border-radius: 999px;
@@ -5708,6 +5739,14 @@ function formatMoneyText(value) {
 
     /** 悬浮窗设置的默认值。 */
     const WIDGET_DEFAULTS = {
+      /**
+       * 用户主动隐藏整个悬浮窗。
+       *
+       * 与 `collapsed` 不同：collapsed 是折叠成一条小药丸（仍常驻可见），
+       * 这个是把整块 UI 从 DOM 里移除。由 issue #10 提出 —— 有用户不需要
+       * 常驻占用屏幕角落。
+       */
+      visible: true,
       collapsed: false,
       /** null 表示「还没手动勾选过」，此时显示全部已配置站点。 */
       sites: null,
@@ -5727,6 +5766,8 @@ function formatMoneyText(value) {
         if (parsed === null || typeof parsed !== 'object') return { ...WIDGET_DEFAULTS }
         return {
           ...WIDGET_DEFAULTS,
+          // 默认**显示**：老用户升级后不该突然消失。只有明确存了 false 才隐藏。
+          visible: parsed.visible !== false,
           collapsed: parsed.collapsed === true,
           sites: Array.isArray(parsed.sites) ? parsed.sites.filter(Boolean).map((id) => String(id)) : null,
           scope: parsed.scope === 'all' ? 'all' : 'selected',
@@ -5856,6 +5897,20 @@ function formatMoneyText(value) {
 
       const [settings, setSettings] = useState(readWidgetSettings)
       const [settingsOpen, setSettingsOpen] = useState(false)
+      /**
+       * 监听主面板的显隐开关。
+       *
+       * 用事件而不是轮询：主面板点一下就变，没有延迟感，也不需要额外定时器。
+       */
+      useEffect(() => {
+        const onVisibleChange = () => setSettings(readWidgetSettings())
+        const canListen = typeof window !== 'undefined'
+          && typeof window.addEventListener === 'function'
+        if (canListen) window.addEventListener(WIDGET_VISIBLE_EVENT, onVisibleChange)
+        return () => {
+          if (canListen) window.removeEventListener(WIDGET_VISIBLE_EVENT, onVisibleChange)
+        }
+      }, [])
       const [probing, setProbing] = useState(false)
       const [hiddenForPanel, setHiddenForPanel] = useState(false)
       const [geometry, setGeometry] = useState(() => readPersistedGeometry()
@@ -6182,9 +6237,43 @@ function formatMoneyText(value) {
 
         if (settings.pinned) {
           clearShift()
+          /**
+           * 修正已保存的越界位置。
+           *
+           * 早先 bottom 的上限是硬编码的 `innerHeight - 120`，那个 120 只够
+           * 露出卡片底部一小截。卡片展开时高约 400px，一旦这个值被存下来，
+           * 每次加载卡片顶部（含标题栏）都会顶出视口 —— 用户看到的是
+           * 「卡在右上角，拖不动也关不掉」，只能清 localStorage。
+           *
+           * 现在按卡片**真实高度**钳制：底部最多留到「卡片完整可见」的位置。
+           * 卡片比视口还高时退化为「至少露出标题栏」（留 56px）。
+           */
+          /**
+           * 取卡片高度。首次渲染时可能还没挂载（高度 0），此时用一个
+           * 保守估计（展开态约 400px）—— 宁可位置偏上一点，也不能让
+           * 标题栏跑到视口外。
+           */
+          const measured = rootRef.current?.getBoundingClientRect?.().height ?? 0
+          const cardHeight = measured > 0 ? measured : 400
+          const minVisible = 56
+          const maxBottom = cardHeight > 0
+            ? Math.max(8, window.innerHeight - cardHeight - 8)
+            : Math.max(8, window.innerHeight - minVisible)
+          // 卡片高到放不下时（小窗口 + 展开态），至少保住标题栏位置
+          /**
+           * 卡片比视口还高时（小窗口 + 展开态），无法让整块可见。
+           * 此时 bottom 取最小值 8 —— 让卡片**顶部对齐视口顶部**，
+           * 保证标题栏（唯一拖拽入口）始终可及。底部超出部分看不到，
+           * 但用户可以折叠或拖到位置合适后再展开。
+           *
+           * 取 8 而不是 0：留一点边距，避免贴边时阴影被裁掉。
+           */
+          const safeBottom = cardHeight >= window.innerHeight - minVisible - 8
+            ? 8
+            : maxBottom
           commitGeometry({
             right: clampNumber(settings.right, 8, Math.max(8, window.innerWidth - WIDGET_MIN_WIDTH - 8)),
-            bottom: clampNumber(settings.bottom, 8, Math.max(8, window.innerHeight - 120)),
+            bottom: clampNumber(settings.bottom, 8, Math.max(8, safeBottom)),
             width: WIDGET_WIDTH,
             overlap: false,
           })
@@ -6365,12 +6454,22 @@ function formatMoneyText(value) {
         const overlay = root?.closest?.('[data-shell-overlay]') ?? root?.parentElement
         if (root === null || root === undefined || overlay === null || overlay === undefined) return
         const overlayRect = overlay.getBoundingClientRect()
+        /**
+         * 记录卡片**真实高度**参与边界钳制。
+         *
+         * 早先只记 width，bottom 的上限是硬编码的 `height - 90` —— 那个
+         * 90 只够露出卡片底部一小截。卡片展开时高约 400px，一旦拖到
+         * 靠近下边界，整块卡片顶部（含标题栏）就被推出视口：既看不见
+         * 也拖不动，只能刷新页面。这是本次修复的核心。
+         */
+        const cardHeight = root.getBoundingClientRect?.().height ?? 0
         const start = {
           x: event.clientX,
           y: event.clientY,
           right: geometry.right,
           bottom: geometry.bottom,
           width: geometry.width,
+          height: cardHeight,
           moved: false,
         }
         root.dataset.dragging = 'true'
@@ -6384,8 +6483,16 @@ function formatMoneyText(value) {
           const dy = moveEvent.clientY - start.y
           if (!start.moved && Math.abs(dx) + Math.abs(dy) < 4) return
           start.moved = true
+          /**
+           * 边界的四条边都要保证「看得见、抓得到」。
+           *
+           * 上下钳制要留出卡片自身高度：bottom 最大 = 容器高 - 卡片高 - 边距，
+           * 否则卡片顶部会顶出视口，标题栏（唯一的拖拽入口）随之消失。
+           * 卡片比容器还高时（小窗口 + 展开态），退化为「至少露出标题栏」。
+           */
+          const maxBottom = Math.max(8, overlayRect.height - start.height - 8)
           const right = clampNumber(start.right - dx, 8, Math.max(8, overlayRect.width - start.width - 8))
-          const bottom = clampNumber(start.bottom - dy, 8, Math.max(8, overlayRect.height - 90))
+          const bottom = clampNumber(start.bottom - dy, 8, maxBottom)
           geometryRef.current = { ...geometryRef.current, right, bottom }
           setGeometry((previous) => ({ ...previous, right, bottom }))
         }
@@ -6416,6 +6523,34 @@ function formatMoneyText(value) {
         setSettings(next)
       }
 
+      /**
+       * 救命快捷键：把悬浮窗拉回可见位置。
+       *
+       * 为什么需要：一旦卡片被拖/存到标题栏跑出视口的位置，用户既看不到
+       * 标题栏（无法拖回），也点不到设置里的「复位」——只能清 localStorage
+       * 或刷新页面。实测有用户卡在这个状态。
+       *
+       * 用 Cmd/Ctrl + Shift + Backspace：与浏览器常用快捷键不冲突，
+       * 且不依赖鼠标位置（标题栏不可见时也能按）。
+       */
+      useEffect(() => {
+        const onRescue = (event) => {
+          const combo = (event?.metaKey === true || event?.ctrlKey === true)
+            && event?.shiftKey === true
+          if (!combo) return
+          if (event?.key !== 'Backspace' && event?.key !== 'Delete') return
+          event.preventDefault?.()
+          resetPosition()
+        }
+        const canListen = typeof document !== 'undefined'
+          && typeof document.addEventListener === 'function'
+        if (canListen) document.addEventListener('keydown', onRescue)
+        return () => {
+          if (canListen) document.removeEventListener('keydown', onRescue)
+        }
+      }, [])
+
+
       const toggleCollapsed = () => updateSettings({ collapsed: !settings.collapsed })
       const openSite = () => openPanel('suppliers')
       const openStats = () => openPanel('stats')
@@ -6434,6 +6569,10 @@ function formatMoneyText(value) {
         return null
       })()
 
+      // 用户主动隐藏（issue #10）：整块 UI 不渲染。
+      // 重新打开走主面板头部的「悬浮窗」开关 —— 必须有那个入口，
+      // 否则隐藏后就没有地方能再打开它。
+      if (settings.visible === false) return null
       if (hiddenForPanel) return null
 
       const head = h('div', {
@@ -6539,15 +6678,121 @@ function formatMoneyText(value) {
         rows,
         foot)
 
+      /**
+       * 折叠态（药丸）的拖拽处理。
+       *
+       * 为什么不复用 onHeadPointerDown：
+       *  · 那个函数有 `closest('button')` 早退判断，药丸内部含设置/刷新按钮，
+       *    点在按钮上会误判；
+       *  · 药丸的 onClick 是「展开」，与拖拽共用一套状态容易互相干扰。
+       *
+       * 这里单独实现，只做三件事：记录起点、移动时更新几何、松手时落盘。
+       * 移动量小于阈值就视为点击（交给 onClick 展开），否则吞掉这次 click。
+       */
+      const pillDraggingRef = useRef(false)
+      /**
+       * 「刚刚拖动过」标记。
+       *
+       * pointerup 之后浏览器才派发 click，而那时 pillDraggingRef 已经复位成
+       * false 了 —— 只看它会误判成点击而展开。这个标记在 onUp 里置位、
+       * 在 click 里消费，专门吃掉「拖完那一下」的 click。
+       */
+      const dragJustEndedRef = useRef(false)
+      const onPillPointerDown = (event) => {
+        if (event.button !== 0) return
+        // 点在药丸内部的按钮上时不拖拽
+        const hitButton = event.target?.closest?.('button')
+        if (hitButton !== null && hitButton !== undefined) return
+        const root = rootRef.current
+        if (root === null || root === undefined) return
+        // 防重入：上一次拖拽会话若未正常结束，直接忽略
+        if (pillDraggingRef.current) return
+        const overlay = root.closest?.('[data-shell-overlay]') ?? root.parentElement ?? root
+        let overlayRect = overlay?.getBoundingClientRect?.()
+        if (overlayRect === undefined || overlayRect === null
+          || !(overlayRect.width > 0) || !(overlayRect.height > 0)) {
+          overlayRect = {
+            width: typeof window !== 'undefined' ? window.innerWidth : 1024,
+            height: typeof window !== 'undefined' ? window.innerHeight : 768,
+          }
+        }
+        const rect = root.getBoundingClientRect?.() ?? { width: 0, height: 0 }
+        const start = {
+          x: event.clientX,
+          y: event.clientY,
+          right: geometry.right,
+          bottom: geometry.bottom,
+          width: rect.width || geometry.width,
+          height: rect.height || 0,
+          moved: false,
+        }
+        pillDraggingRef.current = true
+        root.dataset.dragging = 'true'
+        const onMove = (moveEvent) => {
+          const dx = moveEvent.clientX - start.x
+          const dy = moveEvent.clientY - start.y
+          if (!start.moved && Math.abs(dx) + Math.abs(dy) < 4) return
+          start.moved = true
+          // 四条边都按药丸**自身尺寸**钳制，保证始终完整可见
+          const maxRight = Math.max(8, overlayRect.width - start.width - 8)
+          const maxBottom = Math.max(8, overlayRect.height - start.height - 8)
+          const right = clampNumber(start.right - dx, 8, maxRight)
+          const bottom = clampNumber(start.bottom - dy, 8, maxBottom)
+          geometryRef.current = { ...geometryRef.current, right, bottom }
+          setGeometry((previous) => ({ ...previous, right, bottom }))
+        }
+        const onUp = () => {
+          window.removeEventListener('pointermove', onMove)
+          window.removeEventListener('pointerup', onUp)
+          window.removeEventListener('pointercancel', onUp)
+          pillDraggingRef.current = false
+          if (start.moved) dragJustEndedRef.current = true
+          delete root.dataset.dragging
+          if (start.moved) {
+            persistGeometry(geometryRef.current)
+            const latest = geometryRef.current
+            const stored = { ...settings, pinned: true, right: latest.right, bottom: latest.bottom }
+            saveWidgetSettings(stored)
+            setSettings(stored)
+          }
+        }
+        window.addEventListener('pointermove', onMove)
+        window.addEventListener('pointerup', onUp)
+        window.addEventListener('pointercancel', onUp)
+      }
+
       const pill = h('div', {
         className: 'tu-float-pill',
         role: 'button',
         tabIndex: 0,
-        onClick: () => updateSettings({ collapsed: false }),
+        /**
+         * 折叠态可拖拽（用独立的 onPillPointerDown，不复用标题栏那套）。
+         *
+         * 点一下展开、按住拖动换位置 —— 两者靠移动距离区分：松手时若几乎
+         * 没移动，当点击处理（展开）；移动过则不展开，只更新位置。
+         */
+        onPointerDown: onPillPointerDown,
+        onClick: () => {
+          /**
+           * 拖动结束后的那一次 click 不该触发展开。
+           *
+           * 但**必须只吞一次**：早先写成「pillDraggingRef 或 dragJustEndedRef
+           * 任一为真就 return 并复位」，问题是 pillDraggingRef 为真时也会复位
+           * 标记，于是下一次纯点击同样被吞 —— 表现是拖过一次之后，点药丸
+           * 再也展不开了（实测复现）。
+           *
+           * 现在只认 dragJustEndedRef，且无条件清掉它。
+           */
+          if (dragJustEndedRef.current) {
+            dragJustEndedRef.current = false
+            return
+          }
+          updateSettings({ collapsed: false })
+        },
         onKeyDown: (event) => {
           if (event?.key === 'Enter' || event?.key === ' ') updateSettings({ collapsed: false })
         },
-        title: t('widget.expand'),
+        title: t('widget.pillHint'),
       },
       h('span', { className: 'tu-float-pulse', 'aria-hidden': true }),
       h('span', null, `${t('widget.todayShort')} `, h('b', null, heroCostText)),
@@ -6632,7 +6877,25 @@ function formatMoneyText(value) {
               className: 'tu-float-btn',
               style: { width: 'auto', padding: '0 7px', fontSize: '10.5px' },
               onClick: resetPosition,
-            }, t('widget.reset'))))
+            }, t('widget.reset'))),
+          /**
+           * 隐藏整个悬浮窗（issue #10）。
+           *
+           * 放在设置面板里是因为这里就是「调整悬浮窗本身」的地方，
+           * 用户改完其它选项自然会看到它。隐藏后从主面板头部的
+           * 「悬浮窗」开关重新打开 —— 两个入口互为兜底。
+           */
+          h('div', { className: 'tu-float-setrow' },
+            h('button', {
+              type: 'button',
+              className: 'tu-float-btn',
+              style: { width: '100%', padding: '5px 7px', fontSize: '11px' },
+              title: t('widget.hideHint'),
+              onClick: () => {
+                updateSettings({ visible: false })
+                setSettingsOpen(false)
+              },
+            }, t('widget.hide'))))
         : null
 
       const showSkeleton = status === 'loading' && data === undefined
@@ -7078,6 +7341,25 @@ function formatMoneyText(value) {
         }
       }, [])
       // 供应商编辑表单：null 表示关闭
+      /**
+       * 悬浮窗显隐（issue #10）。
+       *
+       * 主面板是隐藏后唯一的唤回入口 —— 悬浮窗隐藏时它自己也看不见了。
+       * 初值从同一份 localStorage 读，与悬浮窗组件共用配置。
+       */
+      const [widgetVisible, setWidgetVisible] = useState(() => readWidgetSettings().visible !== false)
+      const toggleWidgetVisible = () => {
+        setWidgetVisible((current) => {
+          const next = current !== true
+          try {
+            const settings = readWidgetSettings()
+            saveWidgetSettings({ ...settings, visible: next })
+            // 通知悬浮窗组件立即响应，不必等页面刷新
+            window.dispatchEvent(new CustomEvent(WIDGET_VISIBLE_EVENT, { detail: { visible: next } }))
+          } catch { /* 隐私模式下只在本次生效 */ }
+          return next
+        })
+      }
       const [supplierForm, setSupplierForm] = useState(null)
       /**
        * 预算编辑表单。
@@ -8526,6 +8808,21 @@ function formatMoneyText(value) {
             onClick: refresh,
             disabled: refreshing,
           }, refreshing ? t('refreshing') : t('refresh')),
+          /**
+           * 悬浮窗开关（issue #10）。
+           *
+           * 必须有这个入口：悬浮窗隐藏后自身不可见，若只把「隐藏」按钮
+           * 放在悬浮窗的设置里，用户点完就再也找不回来了。
+           * 用 aria-pressed 表达开关语义，读屏能读出「已开/已关」。
+           */
+          h('button', {
+            type: 'button',
+            className: 'tu-button',
+            'aria-pressed': widgetVisible ? 'true' : 'false',
+            'data-active': widgetVisible ? 'true' : 'false',
+            title: widgetVisible ? t('widget.hideTip') : t('widget.showTip'),
+            onClick: toggleWidgetVisible,
+          }, widgetVisible ? t('widget.on') : t('widget.off')),
           headTools,
         ),
       )
