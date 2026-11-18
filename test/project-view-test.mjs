@@ -274,8 +274,9 @@ const SUMMARY = {
     '/work/delta': COUNTERS(500_000),
   },
   byModel: {},
-  byModelName: {},
-  byModelFacets: {},
+  // 模型下拉的选项来自 byModelName；项目视图不读它（只用于验证提示文案）
+  byModelName: { 'deepseek-v4.1-flash': COUNTERS(1_500_000_000, 23_456, 40_000_000, 1_450_000_000) },
+  byModelFacets: { 'deepseek-v4.1-flash': { provider: {}, project: {}, origin: {}, account: {}, day: {} } },
   byModelDay: {},
   byDayModel: {},
   byDayModelName: {},
@@ -658,6 +659,46 @@ await new Promise((resolve) => setTimeout(resolve, 200))
   check('Enter 后变成亿', afterEnter.includes('15亿'), true)
   keyboardCard?.props?.onKeyDown?.({ key: ' ', preventDefault: () => { prevented = true } })
   check('Space 触发切换（回到 B）', textsOf(render()).includes('1.5B'), true)
+}
+
+// —— T3-5b：模型筛选与项目视图的关系（项目视图是全模型口径）——
+{
+  let tree = render()
+  let modelDropdown
+  walkTree(tree, (node) => {
+    if (node?.props?.className === 'tu-dropdown') modelDropdown = modelDropdown ?? node
+  })
+  let btn
+  walkTree(modelDropdown, (node) => { if (node?.props?.className === 'tu-dropbtn') btn = node })
+  btn?.props?.onClick?.()
+  tree = render()
+  let modelItem
+  walkTree(tree, (node) => {
+    if (node?.props?.className === 'tu-dropitem'
+      && textsOf(node).includes('deepseek-v4.1-flash')) modelItem = modelItem ?? node
+  })
+  check('模型下拉可选模型', modelItem !== undefined, true)
+  modelItem?.props?.onClick?.()
+
+  // alpha 在 T3-2 已经选中、之后没有取消（再点同一项会取消选择，
+  // 所以这里不再点一次，直接看当前渲染）
+  const flat = projectText(render())
+  check('模型筛选后项目观察区仍在', flat.includes('项目观察'), true)
+  check('有模型筛选时提示全模型口径', flat.includes('项目视图为全模型口径'), true)
+  // 数据也没被模型筛选裁掉（仍是全模型口径的 21M）
+  check('提示时项目数据仍为全模型口径', flat.includes('21M'), true)
+
+  // 清掉模型筛选：后续用例依赖「未筛选」状态。
+  // 注意菜单在勾选后仍然开着，这里不能再点按钮（那会把它收起）。
+  const clear = render()
+  let allModelItem
+  walkTree(clear, (node) => {
+    if (node?.props?.className === 'tu-dropitem' && textsOf(node).includes('全部模型')) {
+      allModelItem = allModelItem ?? node
+    }
+  })
+  allModelItem?.props?.onClick?.()
+  check('清空模型筛选后提示消失', projectText(render()).includes('项目视图为全模型口径'), false)
 }
 
 // —— T3-6：空态 —— 逐日被 retention 裁掉 / 只有一天 / 不出现 NaN ——
