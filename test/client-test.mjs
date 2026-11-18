@@ -664,6 +664,43 @@ function textsOf(node) {
   return out.join(' ')
 }
 
+/**
+ * 模型筛选下拉的容器。
+ *
+ * 页面现在有两个形态相同的下拉（模型多选 / 项目单选），按钮与选项的
+ * className 完全一样。断言必须限定在模型下拉内部，否则「最后一个
+ * tu-dropbtn」会取到项目下拉，菜单内容也混在一起。
+ */
+function modelDropdownOf(tree) {
+  let found
+  walkTree(tree, (node) => {
+    if (node?.props?.className === 'tu-dropdown') found = node
+  })
+  return found
+}
+
+/** 取某个下拉容器里的按钮（精确匹配 tu-dropbtn，避开 -text 子节点）。 */
+function dropBtnOf(dropdown) {
+  let btn
+  if (dropdown !== undefined) {
+    walkTree(dropdown, (node) => {
+      if (node?.props?.className === 'tu-dropbtn') btn = node
+    })
+  }
+  return btn
+}
+
+/** 取某个下拉容器里的选项节点。 */
+function dropItemsOf(dropdown) {
+  const items = []
+  if (dropdown !== undefined) {
+    walkTree(dropdown, (node) => {
+      if (typeof node?.props?.className === 'string' && node.props.className.includes('tu-dropitem')) items.push(node)
+    })
+  }
+  return items
+}
+
 function renderWithTab(tabLabel) {
   resetHooks()
   let rendered = panel.component({ t: panelInject.t, locale: panelInject.locale })
@@ -1061,12 +1098,9 @@ check('中文环境下注入的 locale 为 zh', zhPanel?.options?.inject?.()?.lo
   function clickDropBtn() {
     resetHooks()
     const tree = panel.component({ t: panelInject.t, locale: panelInject.locale })
-    let found
-    walkTree(tree, (node) => {
-      // 精确匹配：`includes` 会连内层的 tu-dropbtn-text 一起匹配，
-      // 遍历到它时会把 found 覆盖成没有 onClick 的节点。
-      if (node?.props?.className === 'tu-dropbtn') found = node
-    })
+    // 限定在模型下拉内部：`includes` 会连内层的 tu-dropbtn-text 一起匹配，
+    // 而页面里还有项目下拉的同名按钮。
+    const found = dropBtnOf(modelDropdownOf(tree))
     found?.props?.onClick?.()
     return { tree, found }
   }
@@ -1074,10 +1108,7 @@ check('中文环境下注入的 locale 为 zh', zhPanel?.options?.inject?.()?.lo
   // 1) 收起状态：有按钮、无菜单
   resetHooks()
   const collapsed = panel.component({ t: panelInject.t, locale: panelInject.locale })
-  let dropBtn
-  walkTree(collapsed, (node) => {
-    if (node?.props?.className === 'tu-dropbtn') dropBtn = node
-  })
+  const dropBtn = dropBtnOf(modelDropdownOf(collapsed))
   check('渲染模型下拉按钮', dropBtn !== undefined, true)
   check('收起时不渲染菜单', textsOf(collapsed).includes('tu-dropmenu') === false, true)
 
@@ -1087,10 +1118,7 @@ check('中文环境下注入的 locale 为 zh', zhPanel?.options?.inject?.()?.lo
   const opened = panel.component({ t: panelInject.t, locale: panelInject.locale })
   check('展开后菜单存在', textsOf(opened).includes('tu-dropmenu'),
     `all=${(() => { resetHooks(); const t2 = panel.component({ t: panelInject.t, locale: panelInject.locale }); const out = []; walkTree(t2, (x) => { if (typeof x?.props?.className === 'string' && x.props.className.includes('tu-drop')) out.push(x.props.className + ':' + Object.keys(x.props).length) }); return out.join(' ; ') })()}`)
-  const items = []
-  walkTree(opened, (node) => {
-    if (typeof node?.props?.className === 'string' && node.props.className.includes('tu-dropitem')) items.push(node)
-  })
+  const items = dropItemsOf(modelDropdownOf(opened))
   const labels = []
   for (const item of items) {
     const texts = []
@@ -1124,10 +1152,7 @@ check('中文环境下注入的 locale 为 zh', zhPanel?.options?.inject?.()?.lo
   // 注意：勾选后菜单仍然开着，这里不能再点按钮（那会把它关掉）。
   resetHooks()
   const secondMenu = panel.component({ t: panelInject.t, locale: panelInject.locale })
-  const secondItems = []
-  walkTree(secondMenu, (node) => {
-    if (typeof node?.props?.className === 'string' && node.props.className.includes('tu-dropitem')) secondItems.push(node)
-  })
+  const secondItems = dropItemsOf(modelDropdownOf(secondMenu))
   secondItems.find((item) => textsOf(item).includes('qfmodel'))?.props?.onClick?.()
   resetHooks()
   const twoPicked = panel.component({ t: panelInject.t, locale: panelInject.locale })
@@ -1136,23 +1161,19 @@ check('中文环境下注入的 locale 为 zh', zhPanel?.options?.inject?.()?.lo
   {
     // 直接读下拉按钮上的文字，而不是整页文本（整页文本受其它标签页影响）。
     let btnText
-    walkTree(twoPicked, (node) => {
-      if (node?.props?.className === 'tu-dropbtn') {
-        const parts = []
-        walkTree(node, (x) => { if (typeof x === 'string') parts.push(x) })
-        btnText = parts.join('')
-      }
-    })
+    const pickedBtn = dropBtnOf(modelDropdownOf(twoPicked))
+    {
+      const parts = []
+      walkTree(pickedBtn, (x) => { if (typeof x === 'string') parts.push(x) })
+      btnText = parts.join('')
+    }
     check('多选后显示已选数量', /已选\s*2/.test(btnText ?? ''), `按钮文字=${String(btnText)}`)
   }
 
   // 5) 取消：菜单仍开着，直接点「全部模型」清空
   resetHooks()
   const clearMenu = panel.component({ t: panelInject.t, locale: panelInject.locale })
-  const clearItems = []
-  walkTree(clearMenu, (node) => {
-    if (typeof node?.props?.className === 'string' && node.props.className.includes('tu-dropitem')) clearItems.push(node)
-  })
+  const clearItems = dropItemsOf(modelDropdownOf(clearMenu))
   clearItems.find((item) => textsOf(item).includes('全部模型'))?.props?.onClick?.()
   resetHooks()
   const cleared = panel.component({ t: panelInject.t, locale: panelInject.locale })
@@ -1496,14 +1517,11 @@ check('中文环境下注入的 locale 为 zh', zhPanel?.options?.inject?.()?.lo
   const pickModel = (name) => {
     resetHooks()
     const tree = panel.component({ t: panelInject.t, locale: panelInject.locale })
-    let btn
-    walkTree(tree, (node) => { if (node?.props?.className === 'tu-dropbtn') btn = node })
-    btn?.props?.onClick?.()
+    dropBtnOf(modelDropdownOf(tree))?.props?.onClick?.()
     resetHooks()
     const opened = panel.component({ t: panelInject.t, locale: panelInject.locale })
-    const items = []
-    walkTree(opened, (node) => { if (node?.props?.className === 'tu-dropitem') items.push(node) })
-    items.find((item) => textsOf(item).trim().endsWith(name))?.props?.onClick?.()
+    dropItemsOf(modelDropdownOf(opened))
+      .find((item) => textsOf(item).trim().endsWith(name))?.props?.onClick?.()
   }
 
   pickModel('deepseek-v4.1-flash')
@@ -1933,18 +1951,13 @@ check('渲染出明细视图标签', baseFlat.includes('tu-tabs-wrap'), true)
 {
   resetHooks()
   const reset = panel.component({ t: panelInject.t, locale: panelInject.locale })
-  const items = []
-  walkTree(reset, (node) => {
-    if (node?.props?.className === 'tu-dropitem') items.push(node)
-  })
+  const items = dropItemsOf(modelDropdownOf(reset))
   const allItem = items.find((item) => textsOf(item).includes('全部模型'))
   allItem?.props?.onClick?.()
   // 收起菜单（点一次按钮切换）
   resetHooks()
   const again = panel.component({ t: panelInject.t, locale: panelInject.locale })
-  let btn
-  walkTree(again, (node) => { if (node?.props?.className === 'tu-dropbtn') btn = node })
-  btn?.props?.onClick?.()
+  dropBtnOf(modelDropdownOf(again))?.props?.onClick?.()
 }
 
 // 图表模式切换：命中率模式应改变 Y 轴刻度格式

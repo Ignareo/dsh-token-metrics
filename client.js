@@ -197,6 +197,8 @@ window.__ModuleLoader__.load({
       'range.all': '全部',
       'filter.model': '模型',
       'filter.allModels': '全部模型',
+      'filter.project': '项目',
+      'filter.allProjects': '全部项目',
       'filter.pickModels': '选择模型',
       'filter.selectedCount': '已选',
       'filter.clear': '清除选择',
@@ -611,6 +613,17 @@ window.__ModuleLoader__.load({
       'section.byOrigin': '按来源',
       'section.accounts': '账号用量',
       'column.project': '项目目录',
+      'project.section': '项目观察',
+      'project.grain.day': '日',
+      'project.grain.week': '周',
+      'project.grain.month': '月',
+      'project.weekUnit': '周',
+      'project.modelNote': '项目视图为全模型口径（不含模型筛选）',
+      'project.emptyDays': '该项目没有逐日明细（可能已超出保留天数）',
+      'project.singleBucket': '该项目在这个粒度下只有 1 个数据点，无法绘制趋势',
+      'project.allTime': '全时段合计',
+      'project.backAll': '返回全部项目',
+      'project.retentionNote': '逐日/逐周/逐月仅覆盖最近保留的 {days} 天',
       'column.origin': '来源',
       'column.account': '账号',
       'column.firstSeen': '首次记录',
@@ -755,6 +768,8 @@ window.__ModuleLoader__.load({
       'range.all': 'All time',
       'filter.model': 'Model',
       'filter.allModels': 'All models',
+      'filter.project': 'Project',
+      'filter.allProjects': 'All projects',
       'filter.pickModels': 'Pick models',
       'filter.selectedCount': 'selected',
       'filter.clear': 'Clear',
@@ -1169,6 +1184,17 @@ window.__ModuleLoader__.load({
       'section.byOrigin': 'By origin',
       'section.accounts': 'Account usage',
       'column.project': 'Project directory',
+      'project.section': 'Project insight',
+      'project.grain.day': 'Day',
+      'project.grain.week': 'Week',
+      'project.grain.month': 'Month',
+      'project.weekUnit': 'wk',
+      'project.modelNote': 'Project view uses all models (the model filter does not apply)',
+      'project.emptyDays': 'No daily detail for this project (it may be older than the retention window)',
+      'project.singleBucket': 'Only one bucket at this granularity — a trend line needs at least two',
+      'project.allTime': 'All-time total',
+      'project.backAll': 'Back to all projects',
+      'project.retentionNote': 'Daily/weekly/monthly buckets cover only the last {days} days',
       'column.origin': 'Origin',
       'column.account': 'Account',
       'column.firstSeen': 'First seen',
@@ -3250,6 +3276,29 @@ body[data-ds-dark-theme] .tu-toasts,
 }
 .tu-row-click:hover {
   background: var(--dsw-alias-bg-layer-2);
+}
+/* 项目观察区：全路径单独一行，超宽时省略（title 里有全文）。 */
+.tu-project-path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tu-project-cards {
+  margin-bottom: 14px;
+}
+.tu-project-tools {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.tu-project-foot {
+  margin-top: 9px;
+}
+/* 项目下拉比模型下拉更宽：短路径仍可能很长。 */
+.tu-dropdown-project .tu-dropbtn {
+  min-width: 150px;
+  max-width: 260px;
 }
 /* 顶部工具栏：页签 + 未定价模型 + 价目表操作同排。
    常驻显示（不再只在有未定价模型时出现），否则页签会跟着消失。 */
@@ -7509,6 +7558,57 @@ function formatMoneyText(value) {
           document.removeEventListener('keydown', onKey)
         }
       }, [modelMenuOpen])
+
+      /**
+       * 单项目下钻：选中的项目工作目录（null = 全部项目）。
+       *
+       * 独立于 selectedModels：模型筛选与项目观察是两个维度，混在同一个
+       * 数组里会让「选了项目又选模型」的含义变得说不清。二者同时存在时，
+       * 项目观察按**全模型**口径计算并显式提示（见项目观察区）。
+       */
+      const [selectedProject, setSelectedProject] = useState(null)
+      const [projectMenuOpen, setProjectMenuOpen] = useState(false)
+      const projectDropdownRef = useRef(null)
+      // 项目观察的聚合粒度：日 / 周 / 月，默认按日（用户最先要看的就是逐日）。
+      const [projectGranularity, setProjectGranularity] = useState('day')
+      const projectSectionRef = useRef(null)
+
+      // 项目下拉同样支持点外部与 Esc 收起；与模型下拉共用一套交互预期，
+      // 但各自判断自己的 ref —— 共用一个 ref 会互相把对方关掉。
+      useEffect(() => {
+        if (!projectMenuOpen) return undefined
+        const onDocClick = (event) => {
+          const host = projectDropdownRef.current
+          if (host === null || host === undefined) return
+          if (typeof host.contains === 'function' && host.contains(event?.target)) return
+          setProjectMenuOpen(false)
+        }
+        const onKey = (event) => {
+          if (event?.key === 'Escape') setProjectMenuOpen(false)
+        }
+        document.addEventListener('mousedown', onDocClick)
+        document.addEventListener('keydown', onKey)
+        return () => {
+          document.removeEventListener('mousedown', onDocClick)
+          document.removeEventListener('keydown', onKey)
+        }
+      }, [projectMenuOpen])
+
+      /**
+       * 选中项目后把「项目观察」区滚进视野。
+       *
+       * 入口在筛选栏、内容在图表下方，不滚动的话用户点了下拉却看不到
+       * 任何变化（表格行点选同理）。
+       */
+      useEffect(() => {
+        if (selectedProject === null) return undefined
+        const host = projectSectionRef.current
+        if (host !== null && host !== undefined && typeof host.scrollIntoView === 'function') {
+          try { host.scrollIntoView({ block: 'start', behavior: 'smooth' }) } catch { /* 旧浏览器忽略 */ }
+        }
+        return undefined
+      }, [selectedProject])
+
       // 版本检查弹窗：{ kind: 'new' | 'same' | 'error', latest, message }
       const [versionDialog, setVersionDialog] = useState(null)
       // 「按日期」表的时间范围与分页。日期多时一次全渲染会很卡，
@@ -7622,6 +7722,29 @@ function formatMoneyText(value) {
         if (data?.byModelName === undefined) return []
         return Object.keys(data.byModelName)
       }, [data])
+
+      /**
+       * 项目下拉的选项：按 token 总量降序。
+       *
+       * 取自 Host 的 byProject（全时段、不被 retentionDays 裁剪），因此
+       * 即使某项目最近没活动，也能从下拉里选中它看历史；有没有逐日明细
+       * 由项目观察区自己的空态说明。
+       */
+      const projectOptions = useMemo(() => {
+        return Object.entries(data?.byProject ?? {})
+          .map(([cwd, counters]) => ({
+            cwd,
+            short: shortPath(cwd),
+            total: counters?.totalTokens ?? 0,
+          }))
+          .sort((a, b) => b.total - a.total)
+      }, [data])
+
+      /** 选中项目；再次点同一项等于取消，回到「全部项目」。 */
+      const pickProject = (cwd) => {
+        setSelectedProject((current) => (current === cwd ? null : cwd))
+        setProjectMenuOpen(false)
+      }
 
       const chartModes = [
         { id: 'total', labelKey: 'chart.mode.total' },
@@ -8959,6 +9082,64 @@ function formatMoneyText(value) {
         )
       }, [data, selectedModels, rangeDays, range, trendGranularity, selectedYear])
 
+      /**
+       * 单项目逐日桶：[day, counters] 升序。
+       *
+       * 数据源是 `data.byDayFacets[day].project[cwd]`（Host 原样透出，未裁剪）。
+       * rangeDays 非空时只取范围内日期，与顶部「今日/近 7 天/年份」口径一致；
+       * 模型筛选**不**参与 —— byModelFacets 的各分维互不相交（.project 里没有
+       * day、.day 里没有 project），「模型 × 项目 × 天」这一层数据不存在，
+       * 客户端拼不出来，也不为此改 Host 协议。
+       */
+      const projectDaily = useMemo(() => {
+        if (data === undefined || selectedProject === null) return []
+        const facets = data.byDayFacets ?? {}
+        const days = rangeDays.length > 0 ? rangeDays : Object.keys(facets).sort()
+        const out = []
+        for (const day of days) {
+          const counters = facets[day]?.project?.[selectedProject]
+          if (counters === undefined) continue
+          out.push([day, counters])
+        }
+        return out
+      }, [data, selectedProject, rangeDays])
+
+      /**
+       * 项目观察的聚合结果：日/周/月分桶 + 区间合计 + 估算成本。
+       *
+       * 分桶走纯函数 bucketDailyCounters（单测直接覆盖周一起点、跨年周、
+       * 自然月与单日数据），这里只负责把桶折成趋势点。
+       */
+      const projectView = useMemo(() => {
+        if (selectedProject === null) return undefined
+        const buckets = bucketDailyCounters(projectDaily, projectGranularity, t('project.weekUnit'))
+        const total = emptyTokenCounters()
+        const costByDay = data?.cost?.byDay ?? {}
+        const dayTotals = data?.byDay ?? {}
+        let costUsd = 0
+        for (const [day, counters] of projectDaily) {
+          for (const field of Object.keys(total)) {
+            const value = Number(counters?.[field])
+            if (Number.isFinite(value)) total[field] += value
+          }
+          // 项目级成本 Host 没有单独记账：按「该项目当天 token 占当天总量的
+          // 比例」折算当天成本。峰谷价差在客户端还原不了，所以是估算值，
+          // 卡片标签上带「≈」。
+          const dayTotal = dayTotals[day]?.totalTokens ?? 0
+          const dayCost = Number(costByDay[day]) || 0
+          if (dayTotal > 0 && dayCost > 0) {
+            costUsd += dayCost * ((counters?.totalTokens ?? 0) / dayTotal)
+          }
+        }
+        return {
+          buckets,
+          points: buckets.map((bucket) => toTrendPoint(bucket.label, bucket.counters, { day: bucket.key })),
+          total,
+          hitRate: hitRateOf(total),
+          costUsd,
+        }
+      }, [data, projectDaily, projectGranularity, selectedProject, t])
+
       // 右上角工具区：Star / 检查更新 / 重载，与刷新按钮并排。
       const starsUrl = props?.repositoryUrl ?? data?.repositoryUrl
       const headTools = h('div', { className: 'tu-actions' },
@@ -9170,6 +9351,44 @@ function formatMoneyText(value) {
                   title: name,
                   onClick: () => toggleModel(name),
                 }, h('span', { className: 'tu-check' }, selectedModels.includes(name) ? '✓' : ''), name)),
+              )
+              : null,
+          )
+          : null,
+        // 项目下钻：单选（不是多选），默认「全部项目」。放在模型筛选旁边，
+        // 因为二者都是「看哪一块数据」的入口，分开放会让人找不到。
+        projectOptions.length > 0
+          ? h('div', { className: 'tu-dropdown tu-dropdown-project', ref: projectDropdownRef },
+            h('span', { className: 'tu-refresh-label' }, t('filter.project')),
+            h('button', {
+              type: 'button',
+              className: 'tu-dropbtn',
+              'data-open': projectMenuOpen ? 'true' : 'false',
+              'aria-expanded': projectMenuOpen ? 'true' : 'false',
+              title: selectedProject ?? t('filter.allProjects'),
+              onClick: () => setProjectMenuOpen((open) => !open),
+            },
+            h('span', { className: 'tu-dropbtn-text' },
+              selectedProject === null ? t('filter.allProjects') : shortPath(selectedProject)),
+            h('span', { className: 'tu-caret', 'aria-hidden': true }, '▾'),
+            ),
+            projectMenuOpen
+              ? h('div', { className: 'tu-dropmenu' },
+                h('button', {
+                  type: 'button',
+                  className: 'tu-dropitem',
+                  'data-checked': selectedProject === null ? 'true' : 'false',
+                  onClick: () => { setSelectedProject(null); setProjectMenuOpen(false) },
+                }, h('span', { className: 'tu-check' }, selectedProject === null ? '✓' : ''), t('filter.allProjects')),
+                projectOptions.map((option) => h('button', {
+                  key: option.cwd,
+                  type: 'button',
+                  className: 'tu-dropitem',
+                  'data-checked': selectedProject === option.cwd ? 'true' : 'false',
+                  // 短路径给可读性，全路径放 title —— 行宽撑不下完整 cwd
+                  title: option.cwd,
+                  onClick: () => pickProject(option.cwd),
+                }, h('span', { className: 'tu-check' }, selectedProject === option.cwd ? '✓' : ''), option.short)),
               )
               : null,
           )
@@ -9601,12 +9820,94 @@ function formatMoneyText(value) {
         )
         : null
 
+      /**
+       * 项目观察区：选中项目后出现，展示该项目的汇总与日/周/月用量趋势。
+       *
+       * 口径说明（用户可见）：
+       *   - 项目视图固定是**全模型**口径：byModelFacets 里没有「模型 × 项目
+       *     × 天」这一层，「按模型的项目」数据不存在；有模型筛选时显式提示，
+       *     而不是悄悄给出一个口径不明的数字；
+       *   - byDayFacets / byDay 受 retentionDays 裁剪，byProject 不裁，
+       *     所以「全时段合计」来自 byProject，逐日/逐周/逐月只覆盖保留窗口，
+       *     两者在区块里分开展示、分别标注。
+       */
+      const projectObserver = selectedProject === null ? null : (() => {
+        const allTime = data?.byProject?.[selectedProject]
+        const retention = Number(data?.config?.retentionDays) || 0
+        const points = projectView?.points ?? []
+        const costText = formatMoney((projectView?.costUsd ?? 0) * (currency === 'cny' ? usdCny : 1))
+        const grainTabs = [
+          { id: 'day', label: t('project.grain.day') },
+          { id: 'week', label: t('project.grain.week') },
+          { id: 'month', label: t('project.grain.month') },
+        ]
+        return h('section', {
+          className: 'tu-section tu-project',
+          ref: projectSectionRef,
+          'data-project': selectedProject,
+        },
+        h('div', { className: 'tu-section-head' },
+          h('h2', { className: 'tu-section-title', title: selectedProject },
+            `${t('project.section')} · ${shortPath(selectedProject)}`),
+          h('div', { className: 'tu-tabs tu-tabs-sm' },
+            grainTabs.map((grain) => h('button', {
+              key: grain.id,
+              type: 'button',
+              className: 'tu-tab',
+              'data-active': projectGranularity === grain.id ? 'true' : 'false',
+              onClick: () => setProjectGranularity(grain.id),
+            }, grain.label)),
+          ),
+        ),
+        h('p', { className: 'tu-hint tu-project-path' }, selectedProject),
+        selectedModels.length > 0
+          ? h('p', { className: 'tu-hint tu-project-note' }, t('project.modelNote'))
+          : null,
+        h('div', { className: 'tu-cards tu-project-cards' },
+          h(MetricCard, {
+            label: t('field.total'),
+            value: projectView?.total?.totalTokens ?? 0,
+            accent: true,
+            fmt: fmtTokens,
+          }),
+          h(MetricCard, { label: t('field.calls'), value: formatNumber(projectView?.total?.calls ?? 0), raw: true }),
+          // 成本是估算（按当天 token 占比折算），标签带 ≈ 说明不是账本值
+          h(MetricCard, { label: `${t('column.cost')}≈`, value: costText, raw: true }),
+          h(MetricCard, {
+            label: t('field.cacheHitRate'),
+            value: `${Math.round((projectView?.hitRate ?? 0) * 100)}%`,
+            raw: true,
+          }),
+        ),
+        points.length === 0
+          ? h('div', { className: 'tu-chart-empty' }, t('project.emptyDays'))
+          : points.length === 1
+            // 一天（或一周/一个月只有一个桶）画不出曲线：明确说明，
+            // 而不是让图表组件吐一句泛泛的「数据不足」。
+            ? h('div', { className: 'tu-chart-empty' }, t('project.singleBucket'))
+            : h(TrendChart, { points, mode: 'total', t, fmt: fmtTokens }),
+        h('p', { className: 'tu-hint tu-project-foot' },
+          `${t('project.allTime')} ${fmtTokens(allTime?.totalTokens ?? 0)}`,
+          retention > 0
+            ? ` · ${t('project.retentionNote').replace('{days}', formatNumber(retention))}`
+            : null,
+        ),
+        )
+      })()
+
       // 明细区：一次只显示一张表，用标签切换。
       // 原先六张表纵向堆叠，页面要滚很久才能看到后面的维度。
       const tableViews = [
         { id: 'model', labelKey: 'table.model', columns: modelColumns, rows: modelRows },
         { id: 'origin', labelKey: 'table.origin', columns: originColumns, rows: originRows },
-        { id: 'project', labelKey: 'table.project', columns: projectColumns, rows: projectRows },
+        // 点行 = 选中该项目（再点同一行取消），与下拉是同一个入口语义
+        {
+          id: 'project',
+          labelKey: 'table.project',
+          columns: projectColumns,
+          rows: projectRows,
+          onRowClick: (row) => setSelectedProject((current) => (current === row.fullPath ? null : row.fullPath)),
+        },
         { id: 'provider', labelKey: 'table.provider', columns: providerColumns, rows: providerRows },
         { id: 'account', labelKey: 'table.account', columns: accountColumns, rows: accountRows },
         { id: 'day', labelKey: 'table.day', columns: dayColumns, rows: dayRows },
@@ -11456,7 +11757,8 @@ function formatMoneyText(value) {
       }
 
       return h('div', { className: 'tu-root' },
-        head, scanBar, toolbar, tabs, accountBar, cards, charts, heatmap, sections,
+        // 项目观察紧跟图表：两者都是「看趋势」，而明细表在更下面。
+        head, scanBar, toolbar, tabs, accountBar, cards, charts, projectObserver, heatmap, sections,
         warn, note, versionModal, priceModal, aliasModal)
     }
 
