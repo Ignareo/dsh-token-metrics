@@ -764,7 +764,8 @@ function renderWithTab(tabLabel) {
   const src = readFileSync(join(here, '..', 'client.js'), 'utf8')
 
   // formatCompact 必须支持 T 档（5 万亿显示 5T 而不是 5000B）
-  const fcFn = src.match(/function formatCompact\(value\) \{[\s\S]*?\n    \}/)[0]
+  // 签名带单位参数：第二参省略时保持 K/M/B/T（默认行为不变）。
+  const fcFn = src.match(/function formatCompact\(value, unit\) \{[\s\S]*?\n    \}/)[0]
   const formatCompact = new Function('formatNumber', `${fcFn}; return formatCompact`)((n) => String(n))
   check('万亿显示为 T 档', formatCompact(9.9e12), '9.9T')
   check('百亿显示为 B 档', formatCompact(1.2e10), '12B')
@@ -815,7 +816,7 @@ function renderWithTab(tabLabel) {
   const src = readFileSync(join(here, '..', 'client.js'), 'utf8')
   // 锚点来自 today prop（不是裸的 data —— 那个变量在组件作用域里不存在）
   check('热力图锚点用 today prop', src.includes('const todayStr = today'), true)
-  check('热力图 props 含 today', src.includes('function ActivityHeatmap({ byDay, t, onPickDay, activeDay, summary, today })'), true)
+  check('热力图 props 含 today', /function ActivityHeatmap\(\{[^}]*today[^}]*\}\)/.test(src), true)
   // 顺序：先对齐周日，再回退 (WEEKS-1) 周
   const alignIdx = src.indexOf('weekStart.setDate(weekStart.getDate() - weekStart.getDay())')
   const backIdx = src.indexOf('start.setDate(start.getDate() - (WEEKS - 1) * WEEK)')

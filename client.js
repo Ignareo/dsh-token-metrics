@@ -32,6 +32,17 @@ window.__ModuleLoader__.load({
     const DEFAULT_REFRESH_MS = 30_000
     /** 记住用户选择的 key。 */
     const REFRESH_STORAGE_KEY = 'dsh-token-metrics:refresh-ms'
+    /**
+     * token 显示单位偏好。
+     *
+     * 'en'（默认，保持现状）= K / M / B / T；'cn' = 万 / 亿。
+     * 与刷新间隔、悬浮窗设置一样存 localStorage。主面板与悬浮窗是两个独立
+     * 的 slot 组件，两边都读同一个键，再用一个自定义事件即时同步——
+     * 否则切换后要刷新页面才看到，两处口径也会不一致。
+     */
+    const TOKEN_UNIT_STORAGE_KEY = 'dsh-token-metrics:token-unit'
+    /** 单位切换事件：主面板写 localStorage 后广播，悬浮窗据此重渲染。 */
+    const TOKEN_UNIT_EVENT = 'dsh-token-metrics:token-unit'
 
     /** 与 Host 侧路由、locale 命名空间保持一致。 */
     /**
@@ -510,6 +521,9 @@ window.__ModuleLoader__.load({
       'currency.usd': 'USD',
       'currency.cny': 'RMB',
       'currency.toggleTitle': '点击换算为人民币 / 美元',
+      'unit.b': 'B',
+      'unit.yi': '亿',
+      'unit.toggleTitle': '点击在 B / 亿 之间切换 token 显示单位',
       'cost.unpriced': '未定价',
       'cost.priced': '已定价',
       'cost.overrideTitle': '补价',
@@ -1065,6 +1079,9 @@ window.__ModuleLoader__.load({
       'currency.usd': 'USD',
       'currency.cny': 'RMB',
       'currency.toggleTitle': 'Click to switch between USD and RMB',
+      'unit.b': 'B',
+      'unit.yi': '亿',
+      'unit.toggleTitle': 'Click to switch the token unit between B and 亿',
       'cost.unpriced': 'Unpriced',
       'cost.priced': 'Priced',
       'cost.overrideTitle': 'Set price',
@@ -3215,6 +3232,25 @@ body[data-ds-dark-theme] .tu-toasts,
   outline: 2px solid var(--dsw-alias-brand-primary);
   outline-offset: 2px;
 }
+/* token 单位切换卡：与成本卡同一套交互（整卡可点 + 键盘可达）。 */
+.tu-card-toggle {
+  cursor: pointer;
+  transition: border-color 150ms ease, background 150ms ease;
+}
+.tu-card-toggle:hover {
+  border-color: var(--dsw-alias-brand-primary);
+}
+.tu-card-toggle:focus-visible {
+  outline: 2px solid var(--dsw-alias-brand-primary);
+  outline-offset: 2px;
+}
+/* 可点行：项目表点一行即选中该项目，光标与悬停给出可点提示。 */
+.tu-row-click {
+  cursor: pointer;
+}
+.tu-row-click:hover {
+  background: var(--dsw-alias-bg-layer-2);
+}
 /* 顶部工具栏：页签 + 未定价模型 + 价目表操作同排。
    常驻显示（不再只在有未定价模型时出现），否则页签会跟着消失。 */
 .tu-toolbar {
@@ -4496,17 +4532,107 @@ body[data-ds-dark-theme] .tu-float-settings,
       return String(n)
     }
 
-    function formatCompact(value) {
+    function formatCompact(value, unit) {
       if (typeof value !== 'number' || !Number.isFinite(value) || value === 0) return '0'
       const abs = Math.abs(value)
       const trim = (text) => (text.includes('.') ? text.replace(/\.0+$/, '') : text)
-      const scaled = (unit, suffix) => trim((value / unit).toFixed(abs / unit >= 100 ? 0 : 1)) + suffix
+      const scaled = (divisor, suffix) => trim((value / divisor).toFixed(abs / divisor >= 100 ? 0 : 1)) + suffix
+      // 'cn' 用「万/亿」：国内平台习惯这么读量级，与金额的 USD/RMB 切换对应。
+      // 阈值按十进制分组，和 'en' 的 K/M/B/T 是两套独立刻度，不混用。
+      if (unit === 'cn') {
+        if (abs >= 1e8) return scaled(1e8, '亿')
+        if (abs >= 1e4) return scaled(1e4, '万')
+        return formatNumber(value)
+      }
       if (abs >= 1e12) return scaled(1e12, 'T')
       if (abs >= 1e9) return scaled(1e9, 'B')
       if (abs >= 1e6) return scaled(1e6, 'M')
       if (abs >= 1e4) return scaled(1e3, 'K')
       return formatNumber(value)
     }
+
+    /**
+     * 读取 token 单位偏好。
+     *
+     * 存的是显式的 'cn' / 'en'，其余值（包括老版本没存过、隐私模式下
+     * localStorage 抛错）一律回落 'en'——默认行为必须与改动前完全一致。
+     */
+    function readTokenUnit() {
+      try {
+        const saved = window.localStorage?.getItem(TOKEN_UNIT_STORAGE_KEY)
+        return saved === 'cn' ? 'cn' : 'en'
+      } catch {
+        return 'en'
+      }
+    }
+
+    /** 空计数器（与 Host 的 emptyCounters 字段一致），供纯函数复用。 */
+    function emptyTokenCounters() {
+      return {
+        calls: 0, inputTokens: 0, outputTokens: 0,
+        cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, totalTokens: 0,
+      }
+    }
+
+    /**
+     * 某一天所在周的**周一**（YYYY-MM-DD）。
+     *
+     * 用 UTC 时间戳做整数回退，而不是「日期减星期几」之外的任何近似：
+     * 跨年周（2026-12-28 所在的那一周跨到 2027-01-03）必须整周对齐，
+     * 否则同一个自然周会被拆成两段、x 轴出现两个「12-28」。
+     * 只接受 YYYY-MM-DD，非法输入返回 undefined（由调用方跳过）。
+     */
+    function mondayOf(day) {
+      if (typeof day !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(day)) return undefined
+      const stamp = Date.UTC(
+        Number(day.slice(0, 4)), Number(day.slice(5, 7)) - 1, Number(day.slice(8, 10)),
+      )
+      if (!Number.isFinite(stamp)) return undefined
+      // getUTCDay(): 0=周日 … 6=周六；换算成「距本周周一几天」= (day + 6) % 7
+      const offset = (new Date(stamp).getUTCDay() + 6) % 7
+      return new Date(stamp - offset * 86_400_000).toISOString().slice(0, 10)
+    }
+
+    /**
+     * 把「日 → counters」按日/周/月聚合成升序序列。
+     *
+     * 纯函数（不读 state、不碰 DOM），所以单测可以直接构造确定性的日桶
+     * 来断言分桶结果；面板只负责按 rangeDays 挑出要传进来的日期。
+     *
+     * @param {Array<[string, object]>} entries 日桶，键为 YYYY-MM-DD
+     * @param {'day'|'week'|'month'} granularity
+     * @param {string} weekSuffix 周标签后缀（中文「周」/ 英文「wk」），由调用方按语言传入
+     * @returns {Array<{key: string, label: string, counters: object}>}
+     */
+    function bucketDailyCounters(entries, granularity, weekSuffix = '周') {
+      const buckets = new Map()
+      for (const entry of entries ?? []) {
+        if (!Array.isArray(entry)) continue
+        const [day, counters] = entry
+        if (typeof day !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(day)) continue
+        if (counters === null || counters === undefined) continue
+        // 周：整周对齐到周一；月：自然月（YYYY-MM）；日：原样保留。
+        const key = granularity === 'week'
+          ? mondayOf(day)
+          : granularity === 'month' ? day.slice(0, 7) : day
+        if (typeof key !== 'string' || key === '') continue
+        const target = buckets.get(key) ?? emptyTokenCounters()
+        for (const field of Object.keys(target)) {
+          const value = Number(counters[field])
+          if (Number.isFinite(value)) target[field] += value
+        }
+        buckets.set(key, target)
+      }
+      return [...buckets.entries()]
+        .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+        .map(([key, counters]) => ({
+          key,
+          // 周标签带「周」后缀，避免与日期的 MM-DD 分不清是哪一天
+          label: granularity === 'week' ? `${key.slice(5)} ${weekSuffix}` : key,
+          counters,
+        }))
+    }
+
 
 /**
  * 格式化金额。
@@ -4733,10 +4859,17 @@ function formatMoneyText(value) {
      * `raw: true` 表示 value 已经是格式化好的文本（如 `245ms`），
      * 直接显示，不再过 formatCompact —— 否则字符串会被当成 0。
      */
-    function MetricCard({ label, value, accent, rate, suffix, raw }) {
+    /**
+     * @param {object} props
+     * @param {(value: number) => string} [props.fmt] 带单位的 token 格式化器。
+     *   由面板按当前单位偏好传入；不传时退回默认的 K/M/B/T（如「调用次数」
+     *   这类不该跟随 token 单位变化的列就不传）。
+     */
+    function MetricCard({ label, value, accent, rate, suffix, raw, fmt }) {
+      const formatToken = typeof fmt === 'function' ? fmt : formatCompact
       const text = raw === true
         ? String(value)
-        : suffix === undefined ? formatCompact(value) : `${value}${suffix}`
+        : suffix === undefined ? formatToken(value) : `${value}${suffix}`
       return h('div', {
         className: 'tu-card',
         'data-accent': accent === true ? 'true' : 'false',
@@ -4866,7 +4999,8 @@ function formatMoneyText(value) {
      * 悬停显示当天各模型的数值。所有序列按同一个最大值缩放，这样曲线的
      * 高低可以直接比较——若各自归一化，视觉上就失去意义。
      */
-    function ModelTrendChart({ modelTrend, t, seriesLabel }) {
+    function ModelTrendChart({ modelTrend, t, seriesLabel, fmt }) {
+      const formatToken = typeof fmt === 'function' ? fmt : formatCompact
       const [hoverIndex, setHoverIndex] = useState(-1)
       const [tipLeft, setTipLeft] = useState(50)
       const days = modelTrend?.days ?? []
@@ -4995,7 +5129,7 @@ function formatMoneyText(value) {
             h('i', { className: 'tu-dot', style: { background: seriesColor(seriesIndex) } }),
             h('span', { className: 'tu-chart-tip-name', title: item.key },
               item.label === 'rest' ? t('chart.groupRest') : item.label),
-            h('span', { className: 'tu-chart-tip-num' }, formatCompact(item.values[hoverDay] ?? 0)),
+            h('span', { className: 'tu-chart-tip-num' }, formatToken(item.values[hoverDay] ?? 0)),
             )),
             )
             : null,
@@ -5009,7 +5143,7 @@ function formatMoneyText(value) {
               return /^\d{4}-\d{2}-\d{2}$/.test(raw) ? raw.slice(5) : raw
             },
             max,
-            formatValue: formatCompact,
+            formatValue: formatToken,
           }),
         ),
         h('div', { className: 'tu-chart-legend' },
@@ -5020,7 +5154,7 @@ function formatMoneyText(value) {
         ),
         // 首/尾时间标签已在画布内的 x 刻度里，这里只居中给个峰值摘要
         h('div', { className: 'tu-chart-axis' },
-          h('span', null, `${formatCompact(max)} ↑`),
+          h('span', null, `${formatToken(max)} ↑`),
         ),
       )
     }
@@ -5033,7 +5167,10 @@ function formatMoneyText(value) {
      *   - 命中率是百分比量纲，所以按模式单独缩放，不能和 token 混在一个 Y 轴；
      *   - 图表宽度随容器走，但内部坐标固定，保证鼠标定位与绘制一致。
      */
-    function TrendChart({ points, mode, t, modelTrend, seriesLabel }) {
+    function TrendChart({ points, mode, t, modelTrend, seriesLabel, fmt }) {
+      // token 量纲的格式化器由面板注入（跟随单位偏好）；命中率/成本模式
+      // 有自己的格式化，不受影响。
+      const formatToken = typeof fmt === 'function' ? fmt : formatCompact
       const [hoverIndex, setHoverIndex] = useState(-1)
       // 提示框的水平位置（百分比）。用实际容器宽度钳制，避免贴边时被推出。
       const [tipLeft, setTipLeft] = useState(50)
@@ -5044,7 +5181,7 @@ function formatMoneyText(value) {
       if (mode === 'model') {
         // modelTrend 由调用方按当前范围算好后传入（见 scopedModelTrend）——
         // 组件内部不能引用面板作用域的变量，那是跨作用域引用，实际拿不到。
-        return h(ModelTrendChart, { modelTrend, t, seriesLabel })
+        return h(ModelTrendChart, { modelTrend, t, seriesLabel, fmt: formatToken })
       }
 
       if (points.length < 2) {
@@ -5140,20 +5277,20 @@ function formatMoneyText(value) {
               },
               h('div', { className: 'tu-chart-tip-label' }, hoverPoint.label),
               h('div', { className: 'tu-chart-tip-value' },
-                `${t('chart.tip.total')} ${formatCompact(hoverPoint.input + hoverPoint.cacheRead + hoverPoint.output)}`),
+                `${t('chart.tip.total')} ${formatToken(hoverPoint.input + hoverPoint.cacheRead + hoverPoint.output)}`),
               h('div', { className: 'tu-chart-tip-sub' },
-                `${t('chart.legend.input')} ${formatCompact(hoverPoint.input)}`),
+                `${t('chart.legend.input')} ${formatToken(hoverPoint.input)}`),
               h('div', { className: 'tu-chart-tip-sub' },
-                `${t('chart.legend.cacheRead')} ${formatCompact(hoverPoint.cacheRead)}`),
+                `${t('chart.legend.cacheRead')} ${formatToken(hoverPoint.cacheRead)}`),
               h('div', { className: 'tu-chart-tip-sub' },
-                `${t('chart.legend.output')} ${formatCompact(hoverPoint.output)}`),
+                `${t('chart.legend.output')} ${formatToken(hoverPoint.output)}`),
               )
               : null,
             ...ChartTicks({
               count: points.length,
               labelOf: (index) => points[index]?.label ?? '',
               max,
-              formatValue: formatCompact,
+              formatValue: formatToken,
             }),
           ),
           h('div', { className: 'tu-chart-legend' },
@@ -5162,7 +5299,7 @@ function formatMoneyText(value) {
             h('span', null, h('i', { className: 'tu-dot tu-dot-output' }), t('chart.legend.output')),
           ),
           h('div', { className: 'tu-chart-axis' },
-            h('span', null, `${formatCompact(Math.max(...totals, 0))} ↑`),
+            h('span', null, `${formatToken(Math.max(...totals, 0))} ↑`),
           ),
         )
       }
@@ -5182,7 +5319,7 @@ function formatMoneyText(value) {
         // 成本内部按「毫美元」放大画图（否则 0.03 这种值在图上贴底），
         // 显示时还原成美元
         : mode === 'cost' ? (value) => `$${(value / 1000).toFixed(3)}`
-          : formatCompact
+          : formatToken
 
       const coords = rawValues.map((value, index) => ({
         x: toX(index), y: toY(value, max), value, point: points[index],
@@ -5338,7 +5475,9 @@ function formatMoneyText(value) {
      * @param {object} props.byDay day -> counters
      * @param {object} props.summary 当期汇总（活跃天数、日均、峰值）
      */
-    function ActivityHeatmap({ byDay, t, onPickDay, activeDay, summary, today }) {
+    function ActivityHeatmap({ byDay, t, onPickDay, activeDay, summary, today, fmt }) {
+      // 格子 tooltip 里的 token 是「用量」，跟随单位偏好；热力图色阶不受影响。
+      const formatToken = typeof fmt === 'function' ? fmt : formatCompact
       const WEEK = 7
       const days = Object.keys(byDay ?? {}).sort()
       // 固定 53 周（一年）。参考 GitHub 日历风：格子边长由容器宽度反算，
@@ -5483,7 +5622,7 @@ function formatMoneyText(value) {
               className: 'tu-heat-cell',
               'data-level': String(levelOf(cell.value)),
               'data-active': activeDay === cell.key ? 'true' : 'false',
-              title: `${cell.key} · ${formatCompact(cell.value)} tokens`,
+              title: `${cell.key} · ${formatToken(cell.value)} tokens`,
               onClick: () => onPickDay?.(cell.key),
             })),
           ),
@@ -5514,7 +5653,8 @@ function formatMoneyText(value) {
       )
     }
 
-    function DonutChart({ items, t, centerLabel }) {
+    function DonutChart({ items, t, centerLabel, fmt }) {
+      const formatToken = typeof fmt === 'function' ? fmt : formatCompact
       const total = items.reduce((sum, item) => sum + item.value, 0)
       if (total <= 0) {
         return h('div', { className: 'tu-chart-empty' }, t('chart.empty'))
@@ -5567,7 +5707,7 @@ function formatMoneyText(value) {
         ),
         ),
         h('div', { className: 'tu-pie-center' },
-          h('div', { className: 'tu-pie-total' }, formatCompact(total)),
+          h('div', { className: 'tu-pie-total' }, formatToken(total)),
           h('div', { className: 'tu-pie-total-label' }, centerLabel ?? t('chart.pie.total')),
         ),
       )
@@ -5583,7 +5723,7 @@ function formatMoneyText(value) {
         h('i', { className: 'tu-dot', style: { background: seriesColor(index) } }),
         h('span', { className: 'tu-pie-legend-name', title: item.label }, item.label),
         h('span', { className: 'tu-pie-legend-pct' }, `${((item.value / total) * 100).toFixed(1)}%`),
-        h('span', { className: 'tu-pie-legend-value' }, formatCompact(item.value)),
+        h('span', { className: 'tu-pie-legend-value' }, formatToken(item.value)),
         )),
       )
 
@@ -5711,8 +5851,14 @@ function formatMoneyText(value) {
       )
     }
 
-    /** 通用表格。columns 描述列，rows 是已经投影好的行。 */
-    function UsageTable({ columns, rows, emptyText }) {
+    /**
+     * 通用表格。columns 描述列，rows 是已经投影好的行。
+     *
+     * token 列在 memo 里保留**数字**、渲染期才格式化（见 formatCell）：
+     * 把格式化结果存进 useMemo 会让它在单位切换后不重算，表格停在上一种
+     * 单位的文字上。数字留在 memo 里，格式化跟着渲染走就不会有这个坑。
+     */
+    function UsageTable({ columns, rows, emptyText, formatCell, onRowClick }) {
       if (rows.length === 0) {
         return h('div', { className: 'tu-empty' }, emptyText)
       }
@@ -5723,13 +5869,31 @@ function formatMoneyText(value) {
               h('th', { key: column.key }, column.label)))),
           h('tbody', null,
             rows.map((row, index) =>
-              h('tr', { key: row.key ?? index },
-                columns.map((column) =>
-                  h('td', {
-                    key: column.key,
-                    className: column.main === true ? 'tu-cell-main' : undefined,
-                    title: typeof row[column.key] === 'string' ? row[column.key] : undefined,
-                  }, row[column.key]))))),
+              h('tr', {
+                key: row.key ?? index,
+                className: typeof onRowClick === 'function' ? 'tu-row-click' : undefined,
+                // 可点行要能被键盘触达：这里用 tabIndex + Enter/Space，
+                // 与成本卡/单位卡同一套可访问性写法。
+                tabIndex: typeof onRowClick === 'function' ? 0 : undefined,
+                onClick: typeof onRowClick === 'function' ? () => onRowClick(row) : undefined,
+                onKeyDown: typeof onRowClick === 'function'
+                  ? (event) => {
+                    if (event?.key === 'Enter' || event?.key === ' ') {
+                      event.preventDefault?.()
+                      onRowClick(row)
+                    }
+                  }
+                  : undefined,
+              },
+              columns.map((column) => {
+                const raw = row[column.key]
+                const shown = typeof formatCell === 'function' ? formatCell(row, column) : raw
+                return h('td', {
+                  key: column.key,
+                  className: column.main === true ? 'tu-cell-main' : undefined,
+                  title: typeof shown === 'string' ? shown : undefined,
+                }, shown)
+              })))),
         ),
       )
     }
@@ -5909,6 +6073,27 @@ function formatMoneyText(value) {
         if (canListen) window.addEventListener(WIDGET_VISIBLE_EVENT, onVisibleChange)
         return () => {
           if (canListen) window.removeEventListener(WIDGET_VISIBLE_EVENT, onVisibleChange)
+        }
+      }, [])
+      /**
+       * token 显示单位（与主面板共用同一个 localStorage 键）。
+       *
+       * 悬浮窗是独立 slot 组件，面板里切换时它已经挂载着——靠事件同步，
+       * 再加一个 storage 监听兜住「另一个标签页改了偏好」的情况。
+       */
+      const [tokenUnit, setTokenUnit] = useState(readTokenUnit)
+      useEffect(() => {
+        const onChange = () => setTokenUnit(readTokenUnit())
+        const canListen = typeof window !== 'undefined'
+          && typeof window.addEventListener === 'function'
+        if (canListen) {
+          window.addEventListener(TOKEN_UNIT_EVENT, onChange)
+          window.addEventListener('storage', onChange)
+        }
+        return () => {
+          if (!canListen) return
+          window.removeEventListener(TOKEN_UNIT_EVENT, onChange)
+          window.removeEventListener('storage', onChange)
         }
       }, [])
       const [probing, setProbing] = useState(false)
@@ -6102,7 +6287,7 @@ function formatMoneyText(value) {
 
       const describeSite = (site) => {
         const usage = usageBySite.get(site.id) ?? { tokens: 0, calls: 0, usd: 0, priced: false, unpriced: false, quota: false }
-        const tokensText = `${t('widget.todayShort')} ${formatCompact(usage.tokens)}`
+        const tokensText = `${t('widget.todayShort')} ${formatCompact(usage.tokens, tokenUnit)}`
         const costText = usage.tokens > 0
           ? (usage.quota
             ? t('widget.subscription')
@@ -6557,7 +6742,7 @@ function formatMoneyText(value) {
 
       const busy = refreshing || probing
       const offline = data !== undefined && typeof error === 'string' && error !== ''
-      const heroTokensText = heroReady ? formatCompact(heroTokens) : '—'
+      const heroTokensText = heroReady ? formatCompact(heroTokens, tokenUnit) : '—'
       const heroCostNumber = heroReady
         ? `${formatMoneyText(convertUsd(heroUsd))}${heroUnpriced ? '+' : ''}`
         : null
@@ -6944,8 +7129,11 @@ function formatMoneyText(value) {
      */
     function QuotaPage({
       t, locale, data, error, busy, notice, onPlan, onRefresh, onCalibrate,
-      selectedModel, onPickModel,
+      selectedModel, onPickModel, fmt,
     }) {
+      // 窗口/模型的 token **用量**跟随单位偏好；capacitySection 里的
+      // 上下文容量、峰谷上下界是「模型能力参数」，语义不同，保持 K/M 原样。
+      const formatToken = typeof fmt === 'function' ? fmt : formatCompact
       const site = data?.site
       const factors = data?.factors ?? {}
       const needsCalibration = data !== undefined && data.plan !== 'go' && Object.keys(factors).length === 0
@@ -6971,7 +7159,7 @@ function formatMoneyText(value) {
         const level = !hasPercent ? 'ok' : percent >= 95 ? 'danger' : percent >= 75 ? 'warn' : 'ok'
         const rate = []
         if (window.perPct?.usd !== undefined) rate.push(`$${formatMoneyText(window.perPct.usd)}`)
-        if (window.perPct?.tokens !== undefined) rate.push(`${formatCompact(window.perPct.tokens)} token`)
+        if (window.perPct?.tokens !== undefined) rate.push(`${formatToken(window.perPct.tokens)} token`)
         return h('section', { className: 'tu-qcard', key: window.key },
           h('div', { className: 'tu-qcard-head' },
             h('span', { className: 'tu-qcard-title' }, t(`quota.window.${window.key}`)),
@@ -7009,9 +7197,9 @@ function formatMoneyText(value) {
                 h('td', { className: 'tu-qtable-model', title: row.model }, row.model),
                 h('td', {
                   title: locale === 'en'
-                    ? `Input ${formatCompact(row.inputTokens ?? 0)} · Output ${formatCompact(row.outputTokens ?? 0)} · Cache read ${formatCompact(row.cacheReadTokens ?? 0)}`
-                    : `输入 ${formatCompact(row.inputTokens ?? 0)} · 输出 ${formatCompact(row.outputTokens ?? 0)} · 缓存读 ${formatCompact(row.cacheReadTokens ?? 0)}`,
-                }, formatCompact(row.tokens)),
+                    ? `Input ${formatToken(row.inputTokens ?? 0)} · Output ${formatToken(row.outputTokens ?? 0)} · Cache read ${formatToken(row.cacheReadTokens ?? 0)}`
+                    : `输入 ${formatToken(row.inputTokens ?? 0)} · 输出 ${formatToken(row.outputTokens ?? 0)} · 缓存读 ${formatToken(row.cacheReadTokens ?? 0)}`,
+                }, formatToken(row.tokens)),
                 h('td', null, `$${formatMoneyText(row.allowance)}`),
                 h('td', null,
                   `${Math.round((row.share ?? 0) * 100)}%`,
@@ -7251,6 +7439,42 @@ function formatMoneyText(value) {
           window.localStorage?.setItem(REFRESH_STORAGE_KEY, String(next))
         } catch { /* 存不了就只在本次生效 */ }
       }
+
+      /**
+       * token 显示单位偏好（'en' = K/M/B/T，'cn' = 万/亿）。
+       *
+       * 单位必须是 state + 显式传参的格式化器，不能做成模块级可变开关：
+       * 本文件里大量格式化结果会被 useMemo 缓存，模块级变量不进依赖数组，
+       * 切换后表格与图表仍显示旧数字。下面所有用到 token 单位的地方都
+       * 走 fmtTokens 或把它作为 prop 往下传。
+       */
+      const [tokenUnit, setTokenUnit] = useState(readTokenUnit)
+      const fmtTokens = useCallback((value) => formatCompact(value, tokenUnit), [tokenUnit])
+      /**
+       * 明细表的 token 列格式化：'en' 保持千分位精确值（明细表的价值就是
+       * 读准确数，改成 1.2B 反而丢信息），'cn' 按万/亿缩写与卡片一致。
+       */
+      const fmtTableTokens = useCallback(
+        (value) => (tokenUnit === 'cn' ? formatCompact(value, 'cn') : formatNumber(value)),
+        [tokenUnit],
+      )
+      const toggleTokenUnit = useCallback(() => {
+        setTokenUnit((current) => {
+          const next = current === 'en' ? 'cn' : 'en'
+          try {
+            window.localStorage?.setItem(TOKEN_UNIT_STORAGE_KEY, next)
+          } catch { /* 隐私模式下只在本次生效 */ }
+          try {
+            // 悬浮窗是另一个 slot 组件，靠事件即时跟随，不必刷新页面。
+            if (typeof window !== 'undefined'
+              && typeof window.dispatchEvent === 'function'
+              && typeof window.CustomEvent === 'function') {
+              window.dispatchEvent(new window.CustomEvent(TOKEN_UNIT_EVENT, { detail: { unit: next } }))
+            }
+          } catch { /* 事件失败不影响本次切换 */ }
+          return next
+        })
+      }, [])
 
       const { status, data, error, refreshing, refresh } = useSummary(refreshMs)
       const [range, setRange] = useState('all')
@@ -8169,14 +8393,15 @@ function formatMoneyText(value) {
               model: aliased ?? rawModel,
               modelHint: aliased === undefined ? undefined : `${rawModel} → ${aliased}`,
               provider: slash === -1 ? '—' : key.slice(0, slash),
+              // token 列保留数字：格式化在渲染期做（见 UsageTable 注释）。
               calls: formatNumber(counters.calls),
-              input: formatNumber(counters.inputTokens),
-              output: formatNumber(counters.outputTokens),
-              cacheRead: formatNumber(counters.cacheReadTokens),
-              reasoning: formatNumber(counters.reasoningTokens),
+              input: counters.inputTokens ?? 0,
+              output: counters.outputTokens ?? 0,
+              cacheRead: counters.cacheReadTokens ?? 0,
+              reasoning: counters.reasoningTokens ?? 0,
               // 命中率由 Host 统一算好；没有就用本地兜底，保证列不空。
               hitRate: `${Math.round((counters.cacheHitRate ?? hitRateOf(counters)) * 100)}%`,
-              total: formatNumber(counters.totalTokens),
+              total: counters.totalTokens ?? 0,
               // 成本：按当前货币显示；未定价的显示「—」并可点开补价。
               ...(() => {
                 const costEntry = data?.cost?.byModel?.[key]
@@ -8275,9 +8500,10 @@ function formatMoneyText(value) {
           .map((row) => ({
             ...row,
             calls: formatNumber(row.calls),
-            input: formatNumber(row.input),
-            output: formatNumber(row.output),
-            total: formatNumber(row.total),
+            // token 列保留数字，格式化放到渲染期
+            input: row.input,
+            output: row.output,
+            total: row.total,
             sortKey: row.total,
           }))
           .sort((a, b) => b.sortKey - a.sortKey)
@@ -8290,9 +8516,9 @@ function formatMoneyText(value) {
             key: day,
             date: day,
             calls: formatNumber(counters.calls),
-            input: formatNumber(counters.inputTokens),
-            output: formatNumber(counters.outputTokens),
-            total: formatNumber(counters.totalTokens),
+            input: counters.inputTokens ?? 0,
+            output: counters.outputTokens ?? 0,
+            total: counters.totalTokens ?? 0,
             sortKey: day,
           }))
           .sort((a, b) => (a.sortKey < b.sortKey ? 1 : -1))
@@ -8340,7 +8566,7 @@ function formatMoneyText(value) {
               provider: entry.provider ?? '—',
               model: entry.model ?? '—',
               lastUsed: formatTime(entry.lastAt, locale),
-              total: formatNumber(counters.totalTokens ?? 0),
+              total: counters.totalTokens ?? 0,
               cost: priced ? `${costSymbol}${value < 0.01 ? value.toFixed(4) : value.toFixed(2)}` : '—',
               costRaw: value,
               sortKey: entry.lastAt ?? 0,
@@ -8359,10 +8585,10 @@ function formatMoneyText(value) {
             key: cwd,
             project: shortPath(cwd),
             calls: formatNumber(counters.calls),
-            input: formatNumber(counters.inputTokens),
-            output: formatNumber(counters.outputTokens),
+            input: counters.inputTokens ?? 0,
+            output: counters.outputTokens ?? 0,
             hitRate: `${Math.round((counters.cacheHitRate ?? hitRateOf(counters)) * 100)}%`,
-            total: formatNumber(counters.totalTokens),
+            total: counters.totalTokens ?? 0,
             sortKey: counters.totalTokens ?? 0,
             fullPath: cwd,
           }))
@@ -8377,9 +8603,9 @@ function formatMoneyText(value) {
             key: origin,
             origin: t(`origin.${origin}`),
             calls: formatNumber(counters.calls),
-            input: formatNumber(counters.inputTokens),
-            output: formatNumber(counters.outputTokens),
-            total: formatNumber(counters.totalTokens),
+            input: counters.inputTokens ?? 0,
+            output: counters.outputTokens ?? 0,
+            total: counters.totalTokens ?? 0,
             sortKey: counters.totalTokens ?? 0,
           }))
           .sort((a, b) => b.sortKey - a.sortKey)
@@ -8411,9 +8637,9 @@ function formatMoneyText(value) {
               key: id,
               account,
               calls: formatNumber(entry.calls ?? 0),
-              input: formatNumber(entry.inputTokens ?? 0),
-              output: formatNumber(entry.outputTokens ?? 0),
-              total: formatNumber(entry.totalTokens ?? 0),
+              input: entry.inputTokens ?? 0,
+              output: entry.outputTokens ?? 0,
+              total: entry.totalTokens ?? 0,
               firstSeen: formatTime(entry.firstAt, locale),
               sortKey: entry.totalTokens ?? 0,
             }
@@ -8965,7 +9191,30 @@ function formatMoneyText(value) {
       })()
 
       const cards = h('div', { className: 'tu-cards' },
-        h(MetricCard, { label: t('field.total'), value: totals?.totalTokens ?? 0, accent: true }),
+        // 总 Token 卡片：整卡可点，点击在 B / 亿 之间切换。交互与成本卡
+        // （USD/RMB）完全一致：role=button + tabIndex + Enter/Space，
+        // label 后缀显示当前单位，切换后有可感知的变化。
+        h('div', {
+          className: 'tu-card tu-card-toggle',
+          'data-accent': 'true',
+          title: t('unit.toggleTitle'),
+          role: 'button',
+          tabIndex: 0,
+          onClick: toggleTokenUnit,
+          onKeyDown: (event) => {
+            if (event?.key === 'Enter' || event?.key === ' ') {
+              event.preventDefault?.()
+              toggleTokenUnit()
+            }
+          },
+        },
+        h('div', { className: 'tu-card-label' },
+          `${t('field.total')} · ${tokenUnit === 'cn' ? t('unit.yi') : t('unit.b')}`),
+        h('div', {
+          className: 'tu-card-value',
+          title: formatNumber(totals?.totalTokens ?? 0),
+        }, fmtTokens(totals?.totalTokens ?? 0)),
+        ),
         // 成本卡片：整张卡可点，点击在 USD / RMB 之间切换。
         h('div', {
           className: 'tu-card tu-card-cost',
@@ -8992,9 +9241,9 @@ function formatMoneyText(value) {
           rate: true,
           suffix: '%',
         }),
-        h(MetricCard, { label: t('field.input'), value: totals?.inputTokens ?? 0 }),
-        h(MetricCard, { label: t('field.output'), value: totals?.outputTokens ?? 0 }),
-        h(MetricCard, { label: t('field.cacheRead'), value: totals?.cacheReadTokens ?? 0 }),
+        h(MetricCard, { label: t('field.input'), value: totals?.inputTokens ?? 0, fmt: fmtTokens }),
+        h(MetricCard, { label: t('field.output'), value: totals?.outputTokens ?? 0, fmt: fmtTokens }),
+        h(MetricCard, { label: t('field.cacheRead'), value: totals?.cacheReadTokens ?? 0, fmt: fmtTokens }),
         // 「缓存写」换成「平均首字」：
         // DeepSeek 的计费只有「缓存命中 / 未命中」两档，没有独立的缓存写，
         // 各 provider 也都不上报 cacheWriteTokens —— 那个卡片恒为 0，
@@ -9004,7 +9253,7 @@ function formatMoneyText(value) {
           value: ttftAverage ?? '—',
           raw: true,
         }),
-        h(MetricCard, { label: t('field.reasoning'), value: totals?.reasoningTokens ?? 0 }),
+        h(MetricCard, { label: t('field.reasoning'), value: totals?.reasoningTokens ?? 0, fmt: fmtTokens }),
         h(MetricCard, { label: t('field.calls'), value: totals?.calls ?? 0 }),
       )
 
@@ -9102,12 +9351,13 @@ function formatMoneyText(value) {
         { key: 'model', label: t('column.model'), main: true },
         { key: 'provider', label: t('column.provider') },
         { key: 'calls', label: t('field.calls') },
-        { key: 'input', label: t('field.input') },
-        { key: 'output', label: t('field.output') },
-        { key: 'cacheRead', label: t('field.cacheRead') },
-        { key: 'reasoning', label: t('field.reasoning') },
+        // format: 'tokens' -> 渲染期按当前单位格式化；次数/命中率不走 token 单位
+        { key: 'input', label: t('field.input'), format: 'tokens' },
+        { key: 'output', label: t('field.output'), format: 'tokens' },
+        { key: 'cacheRead', label: t('field.cacheRead'), format: 'tokens' },
+        { key: 'reasoning', label: t('field.reasoning'), format: 'tokens' },
         { key: 'hitRate', label: t('field.cacheHitRate') },
-        { key: 'total', label: t('field.total') },
+        { key: 'total', label: t('field.total'), format: 'tokens' },
         // 性能两列：来自实时事件时间戳，历史数据补不出来，缺值显示「—」
         { key: 'ttft', label: t('column.ttft') },
         { key: 'tps', label: t('column.tps') },
@@ -9117,51 +9367,51 @@ function formatMoneyText(value) {
       const providerColumns = [
         { key: 'provider', label: t('column.providerKind'), main: true },
         { key: 'calls', label: t('field.calls') },
-        { key: 'input', label: t('field.input') },
-        { key: 'output', label: t('field.output') },
-        { key: 'total', label: t('field.total') },
+        { key: 'input', label: t('field.input'), format: 'tokens' },
+        { key: 'output', label: t('field.output'), format: 'tokens' },
+        { key: 'total', label: t('field.total'), format: 'tokens' },
       ]
 
       const dayColumns = [
         { key: 'date', label: t('column.date'), main: true },
         { key: 'calls', label: t('field.calls') },
-        { key: 'input', label: t('field.input') },
-        { key: 'output', label: t('field.output') },
-        { key: 'total', label: t('field.total') },
+        { key: 'input', label: t('field.input'), format: 'tokens' },
+        { key: 'output', label: t('field.output'), format: 'tokens' },
+        { key: 'total', label: t('field.total'), format: 'tokens' },
       ]
 
       const projectColumns = [
         { key: 'project', label: t('column.project'), main: true },
         { key: 'calls', label: t('field.calls') },
-        { key: 'input', label: t('field.input') },
-        { key: 'output', label: t('field.output') },
+        { key: 'input', label: t('field.input'), format: 'tokens' },
+        { key: 'output', label: t('field.output'), format: 'tokens' },
         { key: 'hitRate', label: t('field.cacheHitRate') },
-        { key: 'total', label: t('field.total') },
+        { key: 'total', label: t('field.total'), format: 'tokens' },
         { key: 'cost', label: t('column.cost') },
       ]
 
       const originColumns = [
         { key: 'origin', label: t('column.origin'), main: true },
         { key: 'calls', label: t('field.calls') },
-        { key: 'input', label: t('field.input') },
-        { key: 'output', label: t('field.output') },
-        { key: 'total', label: t('field.total') },
+        { key: 'input', label: t('field.input'), format: 'tokens' },
+        { key: 'output', label: t('field.output'), format: 'tokens' },
+        { key: 'total', label: t('field.total'), format: 'tokens' },
       ]
 
       const accountColumns = [
         { key: 'account', label: t('column.account'), main: true },
         { key: 'calls', label: t('field.calls') },
-        { key: 'input', label: t('field.input') },
-        { key: 'output', label: t('field.output') },
+        { key: 'input', label: t('field.input'), format: 'tokens' },
+        { key: 'output', label: t('field.output'), format: 'tokens' },
         { key: 'firstSeen', label: t('column.firstSeen') },
-        { key: 'total', label: t('field.total') },
+        { key: 'total', label: t('field.total'), format: 'tokens' },
       ]
 
       const sessionColumns = [
         { key: 'session', label: t('column.session'), main: true },
         { key: 'model', label: t('column.model') },
         { key: 'lastUsed', label: t('column.lastUsed') },
-        { key: 'total', label: t('field.total') },
+        { key: 'total', label: t('field.total'), format: 'tokens' },
         // 成本按模型单价折算，峰谷差异还原不了，所以是估算
         { key: 'cost', label: `${t('column.cost')}≈` },
       ]
@@ -9209,7 +9459,7 @@ function formatMoneyText(value) {
         : h('div', { className: 'tu-failed' },
           h('span', null, `${t('failed.count')}：${formatNumber(failed.count)}`),
           (failed.billable ?? 0) > 0
-            ? h('span', null, `${t('failed.billable')}：${formatNumber(failed.billable)}（${t('failed.tokens')} ${formatCompact(failed.totalTokens ?? 0)}）`)
+            ? h('span', null, `${t('failed.billable')}：${formatNumber(failed.billable)}（${t('failed.tokens')} ${fmtTokens(failed.totalTokens ?? 0)}）`)
             : null,
           h('span', { className: 'tu-failed-note' }, t('failed.note')),
         )
@@ -9251,10 +9501,10 @@ function formatMoneyText(value) {
         const average = activeDays > 0 ? tokenSum / activeDays : 0
         const items = [
           { label: t('heat.days'), value: `${activeDays} / ${days.length}` },
-          { label: t('heat.average'), value: formatCompact(average) },
+          { label: t('heat.average'), value: fmtTokens(average) },
           {
             label: t('heat.peak'),
-            value: formatCompact(peakValue),
+            value: fmtTokens(peakValue),
             hint: peakDay === '' ? undefined : peakDay.slice(5),
           },
         ]
@@ -9296,6 +9546,7 @@ function formatMoneyText(value) {
           today: data?.today,
           t,
           summary: heatSummary,
+          fmt: fmtTokens,
           activeDay: dayFrom,
           onPickDay: (day) => {
             setTableView('day')
@@ -9325,6 +9576,7 @@ function formatMoneyText(value) {
               points: trendSeries,
               mode: chartMode,
               t,
+              fmt: fmtTokens,
               // 传按范围重建的版本，而不是 Host 的全量 modelTrend ——
               // 否则切「今日」时曲线仍显示全部历史（用户实测发现）
               modelTrend: scopedModelTrend,
@@ -9343,7 +9595,7 @@ function formatMoneyText(value) {
               h('div', { className: 'tu-section-head' },
                 h('h2', { className: 'tu-section-title' }, t('chart.pie.title')),
               ),
-              h(DonutChart, { items: modelPieItems, t, centerLabel: t('chart.pie.total') }),
+              h(DonutChart, { items: modelPieItems, t, centerLabel: t('chart.pie.total'), fmt: fmtTokens }),
             )
             : null,
         )
@@ -9420,6 +9672,12 @@ function formatMoneyText(value) {
             columns: activeView.columns,
             rows: activeView.rows,
             emptyText: t('empty'),
+            // token 列在渲染期才格式化：unit 变化时表格立即跟着变，
+            // 同时 memo 里只存数字（不存字符串），不会缓住旧单位。
+            formatCell: (row, column) => (column.format === 'tokens'
+              ? fmtTableTokens(row[column.key])
+              : row[column.key]),
+            onRowClick: activeView.onRowClick,
           }),
           // 只有日期视图需要分页。
           activeView.id === 'day' && pageCount > 1
@@ -11191,6 +11449,7 @@ function formatMoneyText(value) {
                 onCalibrate: calibrateQuota,
                 selectedModel: quotaModel,
                 onPickModel: setQuotaModel,
+                fmt: fmtTokens,
               })
               : supplierPage,
           supplierModal, modelsModal, versionModal)
