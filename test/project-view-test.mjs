@@ -55,7 +55,15 @@ function extractFunction(name) {
     [999, '999', '999'],
     [1234, '1,234', '1,234'],
     [1.2e4, '12K', '1.2万'],
+    [1e4, '10K', '1万'],
+    [1.234e6, '1.2M', '123.4万'],
     [3.2e7, '32M', '3200万'],
+    // 万 -> 亿 的跨档临界：9999.9999 万四舍五入到 10000 万，中文里写作 1 亿
+    [99999999, '100M', '1亿'],
+    [1e8, '100M', '1亿'],
+    // 小数位按量级自适应：亿档 < 10 保留两位，1.04 亿/1.05 亿不再被压成 1 亿/1.1 亿
+    [1.04e8, '104M', '1.04亿'],
+    [1.05e8, '105M', '1.05亿'],
     [1.5e9, '1.5B', '15亿'],
     [5e12, '5T', '50000亿'],
   ]
@@ -552,7 +560,7 @@ await new Promise((resolve) => setTimeout(resolve, 200))
   const tree = await renderFresh()
   check('默认没有项目观察区', projectText(tree), '')
   const flat = textsOf(tree)
-  check('总 Token 卡片 label 带默认单位', flat.includes('总量 · B'), true)
+  check('总 Token 卡片 label 带默认档位名', flat.includes('总量 · B/T'), true)
   check('默认单位下显示 1.5B', flat.includes('1.5B'), true)
 }
 
@@ -624,7 +632,7 @@ await new Promise((resolve) => setTimeout(resolve, 200))
   tree = render()
   const flatAfter = textsOf(tree)
   check('切换后同一数值变亿', flatAfter.includes('15亿'), true)
-  check('切换后 label 显示亿', flatAfter.includes('总量 · 亿'), true)
+  check('切换后 label 显示万/亿档位名', flatAfter.includes('总量 · 万/亿'), true)
   check('切换后不再显示 1.5B', flatAfter.includes('1.5B'), false)
   // 反例：金额 / 百分比 / 调用次数不能跟着变
   check('切换后金额不变', (flatAfter.match(/\$\d+\.\d+/g) ?? []).join(','), costBefore)
@@ -644,7 +652,7 @@ await new Promise((resolve) => setTimeout(resolve, 200))
   again?.props?.onClick?.()
   const flatBack = textsOf(render())
   check('再点回 B', flatBack.includes('1.5B'), true)
-  check('再点回 B 后 label 复位', flatBack.includes('总量 · B'), true)
+  check('再点回 B 后 label 复位', flatBack.includes('总量 · B/T'), true)
   check('再点回 B 后金额仍不变', (flatBack.match(/\$\d+\.\d+/g) ?? []).join(','), costBefore)
 
   // 键盘可达：Enter 与 Space 都能触发切换
@@ -776,6 +784,38 @@ await new Promise((resolve) => setTimeout(resolve, 200))
   check('明细表 token 列默认仍为千分位', flat.includes('21,000,000'), true)
 }
 
+// —— 明细表 token 列：cn 模式显示缩写，但 hover title 仍是精确千分位 ——
+{
+  const tree = await renderFresh()
+  // 切到项目明细表
+  walkTree(tree, (node) => {
+    if (node?.type === 'button' && Array.isArray(node.children)
+      && node.children.some((child) => child === '项目')) node.props?.onClick?.()
+  })
+  // 切到 cn 模式（点总量卡）
+  let card
+  walkTree(render(), (node) => {
+    if (node?.props?.className === 'tu-card tu-card-toggle') card = card ?? node
+  })
+  card?.props?.onClick?.()
+  const cnTree = render()
+  // 收集 token 列的单元格：文本 + title
+  const cells = []
+  walkTree(cnTree, (node) => {
+    if (node?.type === 'td' && typeof node.props?.title === 'string') {
+      const text = (node.children ?? []).filter((child) => typeof child === 'string').join('')
+      cells.push({ text, title: node.props.title })
+    }
+  })
+  // alpha 的 21,000,000：显示「2100万」，title 必须是精确千分位
+  const alphaCell = cells.find((cell) => cell.title === '21,000,000')
+  check('cn 模式单元格显示缩写', alphaCell?.text, '2100万')
+  check('cn 模式 title 仍是精确千分位', alphaCell?.title, '21,000,000')
+  // 所有 token 列 title 都必须是千分位形态（不含「万/亿」）
+  check('token 列 title 不带中文单位',
+    cells.every((cell) => !/[万亿]/.test(cell.title)), true)
+}
+
 // —— i18n：新增 key 必须中英两侧都有 ——
 {
   const dicts = localeRegistrations[0]?.dicts ?? {}
@@ -787,11 +827,16 @@ await new Promise((resolve) => setTimeout(resolve, 200))
     'filter.project', 'filter.allProjects', 'project.section', 'project.grain.day',
     'project.grain.week', 'project.grain.month', 'project.weekUnit', 'project.modelNote',
     'project.emptyDays', 'project.singleBucket', 'project.allTime', 'project.retentionNote',
-    'unit.b', 'unit.yi', 'unit.toggleTitle',
+    'unit.toggleTitle',
   ]) {
     check(`文案有 ${key}（zh）`, typeof dicts.zh?.[key], 'string')
     check(`文案有 ${key}（en）`, typeof dicts.en?.[key], 'string')
   }
+  // 英文文案里不得残留中文「亿/万」（单位档位名在代码常量里，不进文案字典）
+  const enWithChineseUnit = Object.entries(dicts.en ?? {})
+    .filter(([, value]) => typeof value === 'string' && /[亿万]/.test(value))
+    .map(([key]) => key)
+  check('英文文案不含中文单位', enWithChineseUnit.join(','), '')
 }
 
 //#endregion

@@ -43,6 +43,13 @@ window.__ModuleLoader__.load({
     const TOKEN_UNIT_STORAGE_KEY = 'dsh-token-metrics:token-unit'
     /** 单位切换事件：主面板写 localStorage 后广播，悬浮窗据此重渲染。 */
     const TOKEN_UNIT_EVENT = 'dsh-token-metrics:token-unit'
+    /**
+     * 单位模式的显示标签。
+     *
+     * 显示的是**档位名**而不是当前数值所在的单档单位：cn 模式下数值可能
+     * 落在万档（2100 万），若卡片后缀写「· 亿」就与数值自相矛盾了。
+     */
+    const TOKEN_UNIT_LABELS = { en: 'B/T', cn: '万/亿' }
 
     /** 与 Host 侧路由、locale 命名空间保持一致。 */
     /**
@@ -523,9 +530,7 @@ window.__ModuleLoader__.load({
       'currency.usd': 'USD',
       'currency.cny': 'RMB',
       'currency.toggleTitle': '点击换算为人民币 / 美元',
-      'unit.b': 'B',
-      'unit.yi': '亿',
-      'unit.toggleTitle': '点击在 B / 亿 之间切换 token 显示单位',
+      'unit.toggleTitle': '点击在 B/T 与 万/亿 之间切换 token 显示单位',
       'cost.unpriced': '未定价',
       'cost.priced': '已定价',
       'cost.overrideTitle': '补价',
@@ -1094,9 +1099,7 @@ window.__ModuleLoader__.load({
       'currency.usd': 'USD',
       'currency.cny': 'RMB',
       'currency.toggleTitle': 'Click to switch between USD and RMB',
-      'unit.b': 'B',
-      'unit.yi': '亿',
-      'unit.toggleTitle': 'Click to switch the token unit between B and 亿',
+      'unit.toggleTitle': 'Click to switch token units between K/M/B/T and the 10K/100M scale',
       'cost.unpriced': 'Unpriced',
       'cost.priced': 'Priced',
       'cost.overrideTitle': 'Set price',
@@ -4586,11 +4589,36 @@ body[data-ds-dark-theme] .tu-float-settings,
       const abs = Math.abs(value)
       const trim = (text) => (text.includes('.') ? text.replace(/\.0+$/, '') : text)
       const scaled = (divisor, suffix) => trim((value / divisor).toFixed(abs / divisor >= 100 ? 0 : 1)) + suffix
-      // 'cn' 用「万/亿」：国内平台习惯这么读量级，与金额的 USD/RMB 切换对应。
-      // 阈值按十进制分组，和 'en' 的 K/M/B/T 是两套独立刻度，不混用。
+      /**
+       * 'cn' 用「万/亿」：国内平台习惯这么读量级，与金额的 USD/RMB 切换对应。
+       * 阈值按十进制分组，和 'en' 的 K/M/B/T 是两套独立刻度，不混用。
+       *
+       * 小数位按量级自适应：一千万级的数字用「万」档时若只给 1 位小数，
+       * 误差能到 5%（1.05 亿显示成 1.1 亿），所以越小的量级给越多位数。
+       *   - 亿：< 10 两位、>= 10 一位、>= 100 零位
+       *   - 万：< 10 两位、>= 10 一位、>= 1000 零位
+       * 尾零一律去掉（1.50 亿 -> 1.5 亿，1.00 亿 -> 1 亿）。
+       *
+       * 万档四舍五入后可能恰好跨到 10000 万（如 99,999,999），这时提升到
+       * 亿档重新格式化输出「1 亿」——中文里不存在「10000 万」这种写法。
+       */
       if (unit === 'cn') {
-        if (abs >= 1e8) return scaled(1e8, '亿')
-        if (abs >= 1e4) return scaled(1e4, '万')
+        // cn 专用去尾零：1.20 -> 1.2、1.50 -> 1.5、1.00 -> 1。
+        // 不复用上面的 trim（它只去「.00」），以免改动 'en' 的既有输出。
+        const trimCn = (text) => (text.includes('.') ? text.replace(/0+$/, '').replace(/\.$/, '') : text)
+        const yi = (amount, magnitude) => trimCn((amount / 1e8).toFixed(
+          magnitude >= 100 ? 0 : magnitude >= 10 ? 1 : 2,
+        )) + '亿'
+        const wan = (amount, magnitude) => trimCn((amount / 1e4).toFixed(
+          magnitude >= 1000 ? 0 : magnitude >= 10 ? 1 : 2,
+        )) + '万'
+        if (abs >= 1e8) return yi(value, abs / 1e8)
+        if (abs >= 1e4) {
+          const magnitude = abs / 1e4
+          // 跨档判断必须看「四舍五入后的值」：9999.9 万 -> 10000 万 -> 1 亿
+          const rounded = Number(magnitude.toFixed(magnitude >= 1000 ? 0 : magnitude >= 10 ? 1 : 2))
+          return rounded >= 1e4 ? yi(value, abs / 1e8) : wan(value, magnitude)
+        }
         return formatNumber(value)
       }
       if (abs >= 1e12) return scaled(1e12, 'T')
@@ -5907,7 +5935,7 @@ function formatMoneyText(value) {
      * 把格式化结果存进 useMemo 会让它在单位切换后不重算，表格停在上一种
      * 单位的文字上。数字留在 memo 里，格式化跟着渲染走就不会有这个坑。
      */
-    function UsageTable({ columns, rows, emptyText, formatCell, onRowClick }) {
+    function UsageTable({ columns, rows, emptyText, formatCell, cellTitle, onRowClick }) {
       if (rows.length === 0) {
         return h('div', { className: 'tu-empty' }, emptyText)
       }
@@ -5937,10 +5965,15 @@ function formatMoneyText(value) {
               columns.map((column) => {
                 const raw = row[column.key]
                 const shown = typeof formatCell === 'function' ? formatCell(row, column) : raw
+                // 悬停提示由调用方给：token 列要给**精确千分位**，而不是
+                // 跟显示文本一样的「万/亿」缩写 —— 否则用户在 cn 模式下
+                // 拿不到准确数（明细表存在的意义就是读准确值）。
+                const hint = typeof cellTitle === 'function' ? cellTitle(row, column) : undefined
+                const title = typeof hint === 'string' ? hint : (typeof shown === 'string' ? shown : undefined)
                 return h('td', {
                   key: column.key,
                   className: column.main === true ? 'tu-cell-main' : undefined,
-                  title: typeof shown === 'string' ? shown : undefined,
+                  title,
                 }, shown)
               })))),
         ),
@@ -9428,7 +9461,8 @@ function formatMoneyText(value) {
           },
         },
         h('div', { className: 'tu-card-label' },
-          `${t('field.total')} · ${tokenUnit === 'cn' ? t('unit.yi') : t('unit.b')}`),
+          // 后缀是「档位名」，不是当前数值的单位（见 TOKEN_UNIT_LABELS 注释）
+          `${t('field.total')} · ${TOKEN_UNIT_LABELS[tokenUnit] ?? TOKEN_UNIT_LABELS.en}`),
         h('div', {
           className: 'tu-card-value',
           title: formatNumber(totals?.totalTokens ?? 0),
@@ -9978,6 +10012,10 @@ function formatMoneyText(value) {
             formatCell: (row, column) => (column.format === 'tokens'
               ? fmtTableTokens(row[column.key])
               : row[column.key]),
+            // token 列的 hover 永远是精确千分位（两种单位模式一致）
+            cellTitle: (row, column) => (column.format === 'tokens'
+              ? formatNumber(row[column.key])
+              : undefined),
             onRowClick: activeView.onRowClick,
           }),
           // 只有日期视图需要分页。
